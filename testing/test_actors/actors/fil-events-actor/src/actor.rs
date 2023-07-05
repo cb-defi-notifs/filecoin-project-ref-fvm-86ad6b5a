@@ -12,6 +12,8 @@ use fvm_shared::event::{Entry, Flags};
 pub fn invoke(params: u32) -> u32 {
     sdk::initialize();
 
+    //sdk::debug::log("I am here1".to_string());
+
     const EMIT_SEVERAL_OK: u64 = 2;
     const EMIT_MALFORMED: u64 = 3;
     const EMIT_SUBCALLS: u64 = 4;
@@ -55,7 +57,15 @@ pub fn invoke(params: u32) -> u32 {
             serialized[1] = 0xff;
 
             assert!(
-                sdk::sys::event::emit_event(serialized.as_ptr(), serialized.len() as u32).is_err(),
+                sdk::sys::event::emit_event(
+                    serialized.as_ptr(),
+                    serialized.len() as u32,
+                    0 as *const u8,
+                    0,
+                    0 as *const u8,
+                    0,
+                )
+                .is_err(),
                 "expected failed syscall"
             );
         },
