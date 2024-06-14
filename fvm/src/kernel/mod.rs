@@ -1,44 +1,25 @@
 // Copyright 2021-2023 Protocol Labs
 // SPDX-License-Identifier: Apache-2.0, MIT
-pub use blocks::{Block, BlockId, BlockRegistry, BlockStat};
-use cid::Cid;
-use fvm_shared::address::Address;
-use fvm_shared::clock::ChainEpoch;
-use fvm_shared::consensus::ConsensusFault;
-use fvm_shared::crypto::signature::{
-    SignatureType, SECP_PUB_LEN, SECP_SIG_LEN, SECP_SIG_MESSAGE_HASH_SIZE,
-};
-use fvm_shared::econ::TokenAmount;
-use fvm_shared::error::ExitCode;
-use fvm_shared::piece::PieceInfo;
-use fvm_shared::randomness::{Randomness, RANDOMNESS_LENGTH};
-use fvm_shared::sector::{
-    AggregateSealVerifyProofAndInfos, RegisteredSealProof, ReplicaUpdateInfo, SealVerifyInfo,
-    WindowPoStVerifyInfo,
-};
-use fvm_shared::sys::out::network::NetworkContext;
-use fvm_shared::sys::out::vm::MessageContext;
-use fvm_shared::sys::SendFlags;
-use fvm_shared::{ActorID, MethodNum};
-
-mod hash;
-
-mod blocks;
-pub mod default;
-
-pub(crate) mod error;
-
-pub use error::{ClassifyResult, Context, ExecutionError, Result, SyscallError};
+use ambassador::delegatable_trait;
 use fvm_shared::event::StampedEvent;
-pub use hash::SupportedHashes;
-use multihash::MultihashGeneric;
 
 use crate::call_manager::CallManager;
-use crate::gas::{Gas, GasTimer, PriceList};
 use crate::machine::limiter::MemoryLimiter;
 use crate::machine::Machine;
+use crate::syscalls::Linker;
 
-pub struct SendResult {
+mod blocks;
+mod error;
+mod hash;
+
+pub mod default;
+pub mod filecoin;
+
+pub use blocks::{Block, BlockId, BlockRegistry, BlockStat};
+pub use error::{ClassifyResult, Context, ExecutionError, Result, SyscallError};
+pub use hash::SupportedHashes;
+
+pub struct CallResult {
     pub block_id: BlockId,
     pub block_stat: BlockStat,
     pub exit_code: ExitCode,
@@ -51,23 +32,11 @@ pub struct SendResult {
 ///
 /// Actors may call into the kernel via the syscalls defined in the [`syscalls`][crate::syscalls]
 /// module.
-pub trait Kernel:
-    ActorOps
-    + IpldBlockOps
-    + CircSupplyOps
-    + CryptoOps
-    + DebugOps
-    + EventOps
-    + GasOps
-    + MessageOps
-    + NetworkOps
-    + RandomnessOps
-    + SelfOps
-    + LimiterOps
-    + 'static
-{
+pub trait Kernel: SyscallHandler<Self> + 'static {
     /// The [`Kernel`]'s [`CallManager`] is
     type CallManager: CallManager;
+    /// The [`Kernel`]'s memory allocation tracker.
+    type Limiter: MemoryLimiter;
 
     /// Consume the [`Kernel`] and return the underlying [`CallManager`] and [`BlockRegistry`].
     fn into_inner(self) -> (Self::CallManager, BlockRegistry)
@@ -97,25 +66,23 @@ pub trait Kernel:
     /// The kernel's underlying "machine".
     fn machine(&self) -> &<Self::CallManager as CallManager>::Machine;
 
-    /// Sends a message to another actor.
-    /// The method type parameter K is the type of the kernel to instantiate for
-    /// the receiving actor. This is necessary to support wrapping a kernel, so the outer
-    /// kernel can specify its Self as the receiver's kernel type, rather than the wrapped
-    /// kernel specifying its Self.
-    /// This method is part of the Kernel trait so it can refer to the Self::CallManager
-    /// associated type necessary to constrain K.
-    fn send<K: Kernel<CallManager = Self::CallManager>>(
-        &mut self,
-        recipient: &Address,
-        method: u64,
-        params: BlockId,
-        value: &TokenAmount,
-        gas_limit: Option<Gas>,
-        flags: SendFlags,
-    ) -> Result<SendResult>;
+    /// Give access to the limiter of the underlying call manager.
+    fn limiter_mut(&mut self) -> &mut Self::Limiter;
+
+    /// Returns the remaining gas for the transaction.
+    fn gas_available(&self) -> Gas;
+
+    /// ChargeGas charges specified amount of `gas` for execution.
+    /// `name` provides information about gas charging point.
+    fn charge_gas(&self, name: &str, compute: Gas) -> Result<GasTimer>;
+}
+
+pub trait SyscallHandler<K>: Sized {
+    fn link_syscalls(linker: &mut Linker<K>) -> anyhow::Result<()>;
 }
 
 /// Network-related operations.
+#[delegatable_trait]
 pub trait NetworkOps {
     /// Network information (epoch, version, etc.).
     fn network_context(&self) -> Result<NetworkContext>;
@@ -125,12 +92,42 @@ pub trait NetworkOps {
 }
 
 /// Accessors to query attributes of the incoming message.
+#[delegatable_trait]
 pub trait MessageOps {
     /// Message information.
     fn msg_context(&self) -> Result<MessageContext>;
 }
 
+/// The actor calling operations.
+#[delegatable_trait]
+pub trait SendOps<K: Kernel = Self> {
+    /// Sends a message to another actor.
+    /// The method type parameter K is the type of the kernel to instantiate for
+    /// the receiving actor. This is necessary to support wrapping a kernel, so the outer
+    /// kernel can specify its Self as the receiver's kernel type, rather than the wrapped
+    /// kernel specifying its Self.
+    /// This method is part of the Kernel trait so it can refer to the Self::CallManager
+    /// associated type necessary to constrain K.
+    fn send(
+        &mut self,
+        recipient: &Address,
+        method: u64,
+        params: BlockId,
+        value: &TokenAmount,
+        gas_limit: Option<Gas>,
+        flags: SendFlags,
+    ) -> Result<CallResult>;
+}
+
+/// The actor upgrade operations.
+#[delegatable_trait]
+pub trait UpgradeOps<K: Kernel = Self> {
+    /// Upgrades the running actor to the specified code CID.
+    fn upgrade_actor(&mut self, new_code_cid: Cid, params_id: BlockId) -> Result<CallResult>;
+}
+
 /// The IPLD subset of the kernel.
+#[delegatable_trait]
 pub trait IpldBlockOps {
     /// Open a block.
     ///
@@ -164,9 +161,10 @@ pub trait IpldBlockOps {
 
 /// Actor state access and manipulation.
 /// Depends on BlockOps to read and write blocks in the state tree.
+#[delegatable_trait]
 pub trait SelfOps: IpldBlockOps {
     /// Get the state root.
-    fn root(&self) -> Result<Cid>;
+    fn root(&mut self) -> Result<Cid>;
 
     /// Update the state-root.
     ///
@@ -176,14 +174,13 @@ pub trait SelfOps: IpldBlockOps {
     /// The balance of the receiver.
     fn current_balance(&self) -> Result<TokenAmount>;
 
-    /// Deletes the executing actor from the state tree, transferring any balance to beneficiary.
-    /// Aborts if the beneficiary does not exist.
-    /// May only be called by the actor itself.
-    fn self_destruct(&mut self, beneficiary: &Address) -> Result<()>;
+    /// Deletes the executing actor from the state tree, burning any remaining balance if requested.
+    fn self_destruct(&mut self, burn_unspent: bool) -> Result<()>;
 }
 
 /// Actors operations whose scope of action is actors other than the calling
 /// actor. The calling actor's state may be consulted to resolve some.
+#[delegatable_trait]
 pub trait ActorOps {
     /// Resolves an address of any protocol to an ID address (via the Init actor's table).
     /// This allows resolution of externally-provided SECP, BLS, or actor addresses to the canonical form.
@@ -211,8 +208,6 @@ pub trait ActorOps {
         delegated_address: Option<Address>,
     ) -> Result<()>;
 
-    /// Installs actor code pointed by cid
-    #[cfg(feature = "m2-native")]
     fn install_actor(&mut self, code_cid: Cid) -> Result<()>;
 
     /// Returns the actor's "type" (if builitin) or 0 (if not).
@@ -225,36 +220,9 @@ pub trait ActorOps {
     fn balance_of(&self, actor_id: ActorID) -> Result<TokenAmount>;
 }
 
-/// Operations to query the circulating supply.
-pub trait CircSupplyOps {
-    /// Returns the total token supply in circulation at the beginning of the current epoch.
-    /// The circulating supply is the sum of:
-    /// - rewards emitted by the reward actor,
-    /// - funds vested from lock-ups in the genesis state,
-    /// less the sum of:
-    /// - funds burnt,
-    /// - pledge collateral locked in storage miner actors (recorded in the storage power actor)
-    /// - deal collateral locked by the storage market actor
-    fn total_fil_circ_supply(&self) -> Result<TokenAmount>;
-}
-
-/// Operations for explicit gas charging.
-pub trait GasOps {
-    /// Returns the gas used by the transaction so far.
-    fn gas_used(&self) -> Gas;
-
-    /// Returns the remaining gas for the transaction.
-    fn gas_available(&self) -> Gas;
-
-    /// ChargeGas charges specified amount of `gas` for execution.
-    /// `name` provides information about gas charging point.
-    fn charge_gas(&self, name: &str, compute: Gas) -> Result<GasTimer>;
-
-    /// Returns the currently active gas price list.
-    fn price_list(&self) -> &PriceList;
-}
-
+#[cfg(feature = "verify-signature")]
 /// Cryptographic primitives provided by the kernel.
+#[delegatable_trait]
 pub trait CryptoOps {
     /// Verifies that a signature is valid for an address and plaintext.
     fn verify_signature(
@@ -263,6 +231,22 @@ pub trait CryptoOps {
         signature: &[u8],
         signer: &Address,
         plaintext: &[u8],
+    ) -> Result<bool>;
+
+    /// Verifies a BLS aggregate signature. In the case where there is one signer/signed plaintext,
+    /// this is equivalent to verifying a non-aggregated BLS signature.
+    ///
+    /// Returns:
+    /// - `Ok(true)` on a valid signature.
+    /// - `Ok(false)` on an invalid signature or if the signature or public keys' bytes represent an
+    ///    invalid curve point.
+    /// - `Err(IllegalArgument)` if `pub_keys.len() != plaintexts.len()`.
+    fn verify_bls_aggregate(
+        &self,
+        aggregate_sig: &[u8; fvm_shared::crypto::signature::BLS_SIG_LEN],
+        pub_keys: &[[u8; fvm_shared::crypto::signature::BLS_PUB_LEN]],
+        plaintexts_concat: &[u8],
+        plaintext_lens: &[u32],
     ) -> Result<bool>;
 
     /// Given a message hash and its signature, recovers the public key of the signer.
@@ -276,77 +260,63 @@ pub trait CryptoOps {
     /// `digest_out`, returning the size of the digest written to `digest_out`. If `digest_out` is
     /// to small to fit the entire digest, it will be truncated. If too large, the leftover space
     /// will not be overwritten.
-    fn hash(&self, code: u64, data: &[u8]) -> Result<MultihashGeneric<64>>;
+    fn hash(&self, code: u64, data: &[u8]) -> Result<Multihash>;
+}
 
-    /// Computes an unsealed sector CID (CommD) from its constituent piece CIDs (CommPs) and sizes.
-    fn compute_unsealed_sector_cid(
-        &self,
-        proof_type: RegisteredSealProof,
-        pieces: &[PieceInfo],
-    ) -> Result<Cid>;
-
-    /// Verifies a sector seal proof.
-    fn verify_seal(&self, vi: &SealVerifyInfo) -> Result<bool>;
-
-    /// Verifies a window proof of spacetime.
-    fn verify_post(&self, verify_info: &WindowPoStVerifyInfo) -> Result<bool>;
-
-    /// Verifies that two block headers provide proof of a consensus fault:
-    /// - both headers mined by the same actor
-    /// - headers are different
-    /// - first header is of the same or lower epoch as the second
-    /// - at least one of the headers appears in the current chain at or after epoch `earliest`
-    /// - the headers provide evidence of a fault (see the spec for the different fault types).
-    /// The parameters are all serialized block headers. The third "extra" parameter is consulted only for
-    /// the "parent grinding fault", in which case it must be the sibling of h1 (same parent tipset) and one of the
-    /// blocks in the parent of h2 (i.e. h2's grandparent).
-    /// Returns nil and an error if the headers don't prove a fault.
-    fn verify_consensus_fault(
-        &self,
-        h1: &[u8],
-        h2: &[u8],
-        extra: &[u8],
-    ) -> Result<Option<ConsensusFault>>;
-
-    /// Verifies a batch of seals. This is a privledged syscall, may _only_ be called by the
-    /// power actor during cron.
+#[cfg(not(feature = "verify-signature"))]
+/// Cryptographic primitives provided by the kernel.
+#[delegatable_trait]
+pub trait CryptoOps {
+    /// Verifies a BLS aggregate signature. In the case where there is one signer/signed plaintext,
+    /// this is equivalent to verifying a non-aggregated BLS signature.
     ///
-    /// Gas: This syscall intentionally _does not_ charge any gas (as said gas would be charged to
-    /// cron). Instead, gas is pre-paid by the storage provider on pre-commit.
-    fn batch_verify_seals(&self, vis: &[SealVerifyInfo]) -> Result<Vec<bool>>;
+    /// Returns:
+    /// - `Ok(true)` on a valid signature.
+    /// - `Ok(false)` on an invalid signature or if the signature or public keys' bytes represent an
+    ///    invalid curve point.
+    /// - `Err(IllegalArgument)` if `pub_keys.len() != plaintexts.len()`.
+    fn verify_bls_aggregate(
+        &self,
+        aggregate_sig: &[u8; fvm_shared::crypto::signature::BLS_SIG_LEN],
+        pub_keys: &[[u8; fvm_shared::crypto::signature::BLS_PUB_LEN]],
+        plaintexts_concat: &[u8],
+        plaintext_lens: &[u32],
+    ) -> Result<bool>;
 
-    /// Verify aggregate seals verifies an aggregated batch of prove-commits.
-    fn verify_aggregate_seals(&self, aggregate: &AggregateSealVerifyProofAndInfos) -> Result<bool>;
+    /// Given a message hash and its signature, recovers the public key of the signer.
+    fn recover_secp_public_key(
+        &self,
+        hash: &[u8; SECP_SIG_MESSAGE_HASH_SIZE],
+        signature: &[u8; SECP_SIG_LEN],
+    ) -> Result<[u8; SECP_PUB_LEN]>;
 
-    /// Verify replica update verifies a snap deal: an upgrade from a CC sector to a sector with
-    /// deals.
-    fn verify_replica_update(&self, replica: &ReplicaUpdateInfo) -> Result<bool>;
+    /// Hashes input `data_in` using with the specified hash function, writing the output to
+    /// `digest_out`, returning the size of the digest written to `digest_out`. If `digest_out` is
+    /// to small to fit the entire digest, it will be truncated. If too large, the leftover space
+    /// will not be overwritten.
+    fn hash(&self, code: u64, data: &[u8]) -> Result<Multihash>;
 }
 
 /// Randomness queries.
+#[delegatable_trait]
 pub trait RandomnessOps {
     /// Randomness returns a (pseudo)random byte array drawing from the latest
-    /// ticket chain from a given epoch and incorporating requisite entropy.
+    /// ticket chain from a given epoch.
     /// This randomness is fork dependant but also biasable because of this.
     fn get_randomness_from_tickets(
         &self,
-        personalization: i64,
         rand_epoch: ChainEpoch,
-        entropy: &[u8],
     ) -> Result<[u8; RANDOMNESS_LENGTH]>;
 
     /// Randomness returns a (pseudo)random byte array drawing from the latest
-    /// beacon from a given epoch and incorporating requisite entropy.
+    /// beacon from a given epoch.
     /// This randomness is not tied to any fork of the chain, and is unbiasable.
-    fn get_randomness_from_beacon(
-        &self,
-        personalization: i64,
-        rand_epoch: ChainEpoch,
-        entropy: &[u8],
-    ) -> Result<[u8; RANDOMNESS_LENGTH]>;
+    fn get_randomness_from_beacon(&self, rand_epoch: ChainEpoch)
+        -> Result<[u8; RANDOMNESS_LENGTH]>;
 }
 
 /// Debugging APIs.
+#[delegatable_trait]
 pub trait DebugOps {
     /// Log a message.
     fn log(&self, msg: String);
@@ -359,19 +329,59 @@ pub trait DebugOps {
     fn store_artifact(&self, name: &str, data: &[u8]) -> Result<()>;
 }
 
-/// Track and limit memory expansion.
-///
-/// This interface is not one of the operations the kernel provides to actors.
-/// It's only part of the kernel out of necessity to pass it through to the
-/// call manager which tracks the limits across the whole execution stack.
-pub trait LimiterOps {
-    type Limiter: MemoryLimiter;
-    /// Give access to the limiter of the underlying call manager.
-    fn limiter_mut(&mut self) -> &mut Self::Limiter;
-}
-
 /// Eventing APIs.
+#[delegatable_trait]
 pub trait EventOps {
     /// Records an event emitted throughout execution.
-    fn emit_event(&mut self, raw_evt: &[u8]) -> Result<()>;
+    fn emit_event(
+        &mut self,
+        event_headers: &[fvm_shared::sys::EventEntry],
+        raw_key: &[u8],
+        raw_val: &[u8],
+    ) -> Result<()>;
 }
+
+// Unfortunately, I need to do this to make it possible to name these macros by path. I'm hiding
+// this because I really don't want users to glob import the `kernel` module.
+#[doc(hidden)]
+pub use {
+    ambassador_impl_CryptoOps, ambassador_impl_DebugOps, ambassador_impl_EventOps,
+    ambassador_impl_IpldBlockOps, ambassador_impl_MessageOps, ambassador_impl_NetworkOps,
+    ambassador_impl_RandomnessOps, ambassador_impl_SelfOps, ambassador_impl_SendOps,
+    ambassador_impl_UpgradeOps,
+};
+
+/// Import this module (with a glob) if you're implementing a kernel, _especially_ if you want to
+/// use ambassador to delegate the implementation.
+pub mod prelude {
+    pub use super::{
+        ActorOps, CryptoOps, DebugOps, EventOps, IpldBlockOps, MessageOps, NetworkOps,
+        RandomnessOps, SelfOps, SendOps, UpgradeOps,
+    };
+    pub use super::{Block, BlockId, BlockRegistry, BlockStat, CallResult, Kernel, SyscallHandler};
+    pub use crate::gas::{Gas, GasTimer, PriceList};
+    pub use ambassador::Delegate;
+    pub use cid::Cid;
+    pub use fvm_shared::address::Address;
+    pub use fvm_shared::clock::ChainEpoch;
+    pub use fvm_shared::crypto::signature::{
+        SignatureType, SECP_PUB_LEN, SECP_SIG_LEN, SECP_SIG_MESSAGE_HASH_SIZE,
+    };
+    pub use fvm_shared::econ::TokenAmount;
+    pub use fvm_shared::error::ExitCode;
+    pub use fvm_shared::randomness::RANDOMNESS_LENGTH;
+    pub use fvm_shared::sys::out::network::NetworkContext;
+    pub use fvm_shared::sys::out::vm::MessageContext;
+    pub use fvm_shared::sys::SendFlags;
+    pub use fvm_shared::version::NetworkVersion;
+    pub use fvm_shared::{ActorID, MethodNum};
+    pub use multihash::Multihash;
+    pub use {
+        ambassador_impl_ActorOps, ambassador_impl_CryptoOps, ambassador_impl_DebugOps,
+        ambassador_impl_EventOps, ambassador_impl_IpldBlockOps, ambassador_impl_MessageOps,
+        ambassador_impl_NetworkOps, ambassador_impl_RandomnessOps, ambassador_impl_SelfOps,
+        ambassador_impl_SendOps, ambassador_impl_UpgradeOps,
+    };
+}
+
+use prelude::*;

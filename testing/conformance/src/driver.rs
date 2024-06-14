@@ -30,6 +30,7 @@ use crate::vm::{TestKernel, TestMachine, TestStatsRef};
 lazy_static! {
     static ref SKIP_TESTS: Vec<Regex> = vec![
         "0001-shark-01/.*", // nv17
+        "0002-hygge-01/.*", // nv18
         ".*/DisputeWindowedPoSt/Ok/.*", // we treat all posts as valid (fake proofs).
     ]
     .into_iter()
@@ -41,8 +42,7 @@ lazy_static! {
     /// Override prices with a different network version.
     static ref PRICE_NETWORK_VERSION: Option<NetworkVersion> = std::env::var("PRICE_NETWORK_VERSION").ok()
         .map(|nv| {
-            let nv = nv.parse::<u32>().expect("PRICE_NETWORK_VERSION should be a number");
-            NetworkVersion::try_from(nv).expect("unknown price network version")
+            nv.parse::<u32>().expect("PRICE_NETWORK_VERSION should be a number").into()
         });
 }
 
@@ -232,7 +232,7 @@ pub fn run_variant(
     // this explicitly.
     engine
         .acquire()
-        .preload(
+        .preload_all(
             machine.blockstore(),
             machine.builtin_actors().builtin_actor_codes(),
         )

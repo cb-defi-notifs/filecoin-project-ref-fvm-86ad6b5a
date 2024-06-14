@@ -16,6 +16,7 @@ mod hamt;
 mod hash;
 mod hash_algorithm;
 mod hash_bits;
+mod iter;
 mod node;
 mod pointer;
 
@@ -23,11 +24,12 @@ pub use forest_hash_utils::{BytesKey, Hash};
 use serde::{Deserialize, Serialize};
 
 pub use self::error::Error;
-pub use self::hamt::Hamt;
-pub use self::hash::*;
+pub use self::hamt::{Hamt, Hamtv0};
 pub use self::hash_algorithm::*;
+pub use self::iter::{Iter, Iterv0};
 
 /// Default bit width for indexing a hash at each depth level
+#[deprecated]
 const DEFAULT_BIT_WIDTH: u32 = 8;
 
 /// Configuration options for a HAMT instance.
@@ -63,6 +65,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            #[allow(deprecated)]
             bit_width: DEFAULT_BIT_WIDTH,
             min_data_depth: 0,
             max_array_width: 3,

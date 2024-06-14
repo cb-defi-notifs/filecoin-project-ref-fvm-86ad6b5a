@@ -7,6 +7,7 @@
 //!
 //! This package emits logs using the log façade. Configure the logging backend
 //! of your choice during the initialization of the consuming application.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 pub use kernel::default::DefaultKernel;
 pub use kernel::Kernel;
@@ -40,19 +41,8 @@ pub mod system_actor;
 
 mod eam_actor;
 mod history_map;
+mod ipld;
 pub mod trace;
-
-use cid::multihash::{Code, MultihashDigest};
-use cid::Cid;
-use fvm_ipld_encoding::{to_vec, DAG_CBOR};
-
-lazy_static::lazy_static! {
-    /// Cid of the empty array Cbor bytes (`EMPTY_ARR_BYTES`).
-    pub static ref EMPTY_ARR_CID: Cid = {
-        let empty = to_vec::<[(); 0]>(&[]).unwrap();
-        Cid::new_v1(DAG_CBOR, Code::Blake2b256.digest(&empty))
-    };
-}
 
 #[cfg(test)]
 mod test {
@@ -65,10 +55,11 @@ mod test {
 
     use crate::call_manager::DefaultCallManager;
     use crate::engine::EnginePool;
+    use crate::executor;
     use crate::externs::{Chain, Consensus, Externs, Rand};
+    use crate::kernel::filecoin::DefaultFilecoinKernel;
     use crate::machine::{DefaultMachine, Manifest, NetworkConfig};
     use crate::state_tree::StateTree;
-    use crate::{executor, DefaultKernel};
 
     struct DummyExterns;
 
@@ -77,9 +68,7 @@ mod test {
     impl Rand for DummyExterns {
         fn get_chain_randomness(
             &self,
-            _pers: i64,
             _round: fvm_shared::clock::ChainEpoch,
-            _entropy: &[u8],
         ) -> anyhow::Result<[u8; 32]> {
             let msg = "mel was here".as_bytes();
             let mut out = [0u8; 32];
@@ -89,9 +78,7 @@ mod test {
 
         fn get_beacon_randomness(
             &self,
-            _pers: i64,
             _round: fvm_shared::clock::ChainEpoch,
-            _entropy: &[u8],
         ) -> anyhow::Result<[u8; 32]> {
             todo!()
         }
@@ -133,13 +120,13 @@ mod test {
 
         let actors_cid = bs.put_cbor(&(1, manifest_cid), Code::Blake2b256).unwrap();
 
-        let mc = NetworkConfig::new(fvm_shared::version::NetworkVersion::V18)
+        let mc = NetworkConfig::new(fvm_shared::version::NetworkVersion::V21)
             .override_actors(actors_cid)
             .for_epoch(0, 0, root);
 
         let machine = DefaultMachine::new(&mc, bs, DummyExterns).unwrap();
-        let engine = EnginePool::new_default((&mc.network).into()).unwrap();
-        let _ = executor::DefaultExecutor::<DefaultKernel<DefaultCallManager<_>>>::new(
+        let engine = EnginePool::new((&mc.network).into()).unwrap();
+        let _ = executor::DefaultExecutor::<DefaultFilecoinKernel<DefaultCallManager<_>>>::new(
             engine,
             Box::new(machine),
         );

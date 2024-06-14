@@ -23,6 +23,9 @@ use serde::Serialize;
 // Redeclaring max array size of Hamt to avoid exposing value
 const BUCKET_SIZE: usize = 3;
 
+// Sizes at which we run variable-sized tests.
+const SIZE_FACTORS: &[usize] = &[1, 5, 19, 71, 104, 200, 983];
+
 /// Help reuse tests with different HAMT configurations.
 #[derive(Default)]
 struct HamtFactory {
@@ -113,6 +116,10 @@ impl CidChecker {
 
 impl Drop for CidChecker {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Already failed, don't double-panic.
+            return;
+        }
         if let Some(cids) = &self.cids {
             assert_eq!(self.checked, cids.len())
         }
@@ -297,49 +304,73 @@ fn reload_empty(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidCheck
     }
 }
 
-fn set_delete_many(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidChecker) {
+fn set_delete_many(
+    size_factor: usize,
+    factory: HamtFactory,
+    stats: Option<BSStats>,
+    mut cids: CidChecker,
+) {
     let mem = MemoryBlockstore::default();
     let store = TrackingBlockstore::new(&mem);
 
     // Test vectors setup specifically for bit width of 5
     let mut hamt: Hamt<_, BytesKey> = factory.new_with_bit_width(&store, 5);
 
-    for i in 0..200 {
+    for i in 0..size_factor {
         hamt.set(tstring(i), tstring(i)).unwrap();
     }
 
     let c1 = hamt.flush().unwrap();
     cids.check_next(c1);
 
-    for i in 200..400 {
+    for i in size_factor..(size_factor * 2) {
         hamt.set(tstring(i), tstring(i)).unwrap();
     }
 
     let cid_all = hamt.flush().unwrap();
     cids.check_next(cid_all);
 
-    for i in 200..400 {
+    for i in size_factor..(size_factor * 2) {
         assert!(hamt.delete(&tstring(i)).unwrap().is_some());
     }
-    // Ensure first 200 keys still exist
-    for i in 0..200 {
+    // Ensure first size_factor keys still exist
+    for i in 0..size_factor {
         assert_eq!(hamt.get(&tstring(i)).unwrap(), Some(&tstring(i)));
     }
+
+    let cid_d = hamt.flush().unwrap();
+    cids.check_next(cid_d);
+
+    // Assert that we can empty it.
+    for i in 0..size_factor {
+        assert!(hamt.delete(&tstring(i)).unwrap().is_some());
+    }
+
+    assert_eq!(hamt.iter().count(), 0);
 
     let cid_d = hamt.flush().unwrap();
     cids.check_next(cid_d);
     if let Some(stats) = stats {
         assert_eq!(*store.stats.borrow(), stats);
     }
+
+    if let Some(stats) = stats {
+        assert_eq!(*store.stats.borrow(), stats);
+    }
 }
 
-fn for_each(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidChecker) {
+fn for_each(
+    size_factor: usize,
+    factory: HamtFactory,
+    stats: Option<BSStats>,
+    mut cids: CidChecker,
+) {
     let mem = MemoryBlockstore::default();
     let store = TrackingBlockstore::new(&mem);
 
     let mut hamt: Hamt<_, BytesKey> = factory.new_with_bit_width(&store, 5);
 
-    for i in 0..200 {
+    for i in 0..size_factor {
         hamt.set(tstring(i), tstring(i)).unwrap();
     }
 
@@ -351,7 +382,7 @@ fn for_each(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidChecker) 
         Ok(())
     })
     .unwrap();
-    assert_eq!(count, 200);
+    assert_eq!(count, size_factor);
 
     let c = hamt.flush().unwrap();
     cids.check_next(c);
@@ -366,7 +397,7 @@ fn for_each(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidChecker) 
         Ok(())
     })
     .unwrap();
-    assert_eq!(count, 200);
+    assert_eq!(count, size_factor);
 
     // Iterating through hamt with cached nodes.
     let mut count = 0;
@@ -376,7 +407,7 @@ fn for_each(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidChecker) 
         Ok(())
     })
     .unwrap();
-    assert_eq!(count, 200);
+    assert_eq!(count, size_factor);
 
     let c = hamt.flush().unwrap();
     cids.check_next(c);
@@ -386,14 +417,18 @@ fn for_each(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidChecker) 
     }
 }
 
-fn for_each_ranged(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidChecker) {
+fn for_each_ranged(
+    size_factor: usize,
+    factory: HamtFactory,
+    stats: Option<BSStats>,
+    mut cids: CidChecker,
+) {
     let mem = MemoryBlockstore::default();
     let store = TrackingBlockstore::new(&mem);
 
     let mut hamt: Hamt<_, usize> = factory.new_with_bit_width(&store, 5);
 
-    const RANGE: usize = 200;
-    for i in 0..RANGE {
+    for i in 0..size_factor {
         hamt.set(tstring(i), i).unwrap();
     }
 
@@ -407,7 +442,7 @@ fn for_each_ranged(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidCh
     .unwrap();
 
     // Iterate through the array, requesting pages of different sizes
-    for page_size in 0..RANGE {
+    for page_size in 0..size_factor {
         let mut kvs_variable_page = Vec::new();
         let (num_traversed, next_key) = hamt
             .for_each_ranged::<BytesKey, _>(None, Some(page_size), |k, v| {
@@ -426,13 +461,13 @@ fn for_each_ranged(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidCh
 
     // Iterate through the array, requesting more items than are remaining
     let (num_traversed, next_key) = hamt
-        .for_each_ranged::<BytesKey, _>(None, Some(RANGE + 10), |_k, _v| Ok(()))
+        .for_each_ranged::<BytesKey, _>(None, Some(size_factor + 10), |_k, _v| Ok(()))
         .unwrap();
-    assert_eq!(num_traversed, RANGE);
+    assert_eq!(num_traversed, size_factor);
     assert_eq!(next_key, None);
 
     // Iterate through it again starting at a certain key
-    for start_at in 0..RANGE {
+    for start_at in 0..size_factor {
         let mut kvs_variable_start = Vec::new();
         let (num_traversed, next_key) = hamt
             .for_each_ranged(Some(&kvs[start_at].0), None, |k, v| {
@@ -458,31 +493,33 @@ fn for_each_ranged(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidCh
         let mut iterations = 0;
         let mut cursor: Option<BytesKey> = None;
 
-        // Request all items in pages of 20 items each
-        const PAGE_SIZE: usize = 20;
+        // Request all items in pages of N items each
+        let page_size: usize = (size_factor / 10).max(1);
         loop {
-            let (page_size, next) = match cursor {
+            let (count, next) = match cursor {
                 Some(ref start) => hamt
-                    .for_each_ranged::<BytesKey, _>(Some(start), Some(PAGE_SIZE), |k, v| {
+                    .for_each_ranged::<BytesKey, _>(Some(start), Some(page_size), |k, v| {
                         kvs_paginated_requests.push((k.clone(), *v));
                         Ok(())
                     })
                     .unwrap(),
                 None => hamt
-                    .for_each_ranged::<BytesKey, _>(None, Some(PAGE_SIZE), |k, v| {
+                    .for_each_ranged::<BytesKey, _>(None, Some(page_size), |k, v| {
                         kvs_paginated_requests.push((k.clone(), *v));
                         Ok(())
                     })
                     .unwrap(),
             };
+            let total_count = iterations * page_size + count;
+            assert_eq!(kvs_paginated_requests.len(), total_count);
             iterations += 1;
-            assert_eq!(page_size, PAGE_SIZE);
-            assert_eq!(kvs_paginated_requests.len(), iterations * PAGE_SIZE);
 
             if next.is_none() {
+                assert_eq!(total_count, size_factor);
                 break;
             } else {
-                assert_eq!(next.clone().unwrap(), kvs[iterations * PAGE_SIZE].0);
+                assert_eq!(count, page_size);
+                assert_eq!(next.clone().unwrap(), kvs[iterations * page_size].0);
                 cursor = next;
             }
         }
@@ -491,7 +528,10 @@ fn for_each_ranged(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidCh
         assert_eq!(kvs_paginated_requests.len(), kvs.len(), "{}", iterations);
         assert_eq!(kvs_paginated_requests, kvs);
         // should have used the expected number of iterations
-        assert_eq!(iterations, RANGE / PAGE_SIZE);
+        assert_eq!(
+            iterations,
+            (size_factor / page_size) + ((size_factor % page_size) > 0) as usize
+        );
     }
 
     let c = hamt.flush().unwrap();
@@ -505,30 +545,32 @@ fn for_each_ranged(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidCh
         let mut cursor: Option<BytesKey> = None;
 
         // Request all items in pages of 20 items each
-        const PAGE_SIZE: usize = 20;
+        let page_size: usize = (size_factor / 10).max(1);
         loop {
-            let (page_size, next) = match cursor {
+            let (count, next) = match cursor {
                 Some(ref start) => hamt
-                    .for_each_ranged::<BytesKey, _>(Some(start), Some(PAGE_SIZE), |k, v| {
+                    .for_each_ranged::<BytesKey, _>(Some(start), Some(page_size), |k, v| {
                         kvs_paginated_requests.push((k.clone(), *v));
                         Ok(())
                     })
                     .unwrap(),
                 None => hamt
-                    .for_each_ranged::<BytesKey, _>(None, Some(PAGE_SIZE), |k, v| {
+                    .for_each_ranged::<BytesKey, _>(None, Some(page_size), |k, v| {
                         kvs_paginated_requests.push((k.clone(), *v));
                         Ok(())
                     })
                     .unwrap(),
             };
+            let total_count = iterations * page_size + count;
+            assert_eq!(kvs_paginated_requests.len(), total_count);
             iterations += 1;
-            assert_eq!(page_size, PAGE_SIZE);
-            assert_eq!(kvs_paginated_requests.len(), iterations * PAGE_SIZE);
 
             if next.is_none() {
+                assert_eq!(total_count, size_factor);
                 break;
             } else {
-                assert_eq!(next.clone().unwrap(), kvs[iterations * PAGE_SIZE].0);
+                assert_eq!(count, page_size);
+                assert_eq!(next.clone().unwrap(), kvs[iterations * page_size].0);
                 cursor = next;
             }
         }
@@ -537,7 +579,10 @@ fn for_each_ranged(factory: HamtFactory, stats: Option<BSStats>, mut cids: CidCh
         assert_eq!(kvs_paginated_requests.len(), kvs.len(), "{}", iterations);
         assert_eq!(kvs_paginated_requests, kvs);
         // should have used the expected number of iterations
-        assert_eq!(iterations, RANGE / PAGE_SIZE);
+        assert_eq!(
+            iterations,
+            (size_factor / page_size) + ((size_factor % page_size) > 0) as usize
+        );
     }
 
     let c = hamt.flush().unwrap();
@@ -893,7 +938,8 @@ fn tstring(v: impl Display) -> BytesKey {
 }
 
 mod test_default {
-    use fvm_ipld_blockstore::tracking::BSStats;
+    use fvm_ipld_blockstore::{tracking::BSStats, MemoryBlockstore};
+    use fvm_ipld_hamt::{Config, Hamtv0};
     use quickcheck_macros::quickcheck;
 
     use crate::{CidChecker, HamtFactory, LimitedKeyOps, UniqueKeyValuePairs};
@@ -965,35 +1011,36 @@ mod test_default {
     #[test]
     fn set_delete_many() {
         #[rustfmt::skip]
-        let stats = BSStats {r: 0, w: 93, br: 0, bw: 11734};
+        let stats = BSStats {r: 0, w: 94, br: 0, bw: 11737};
         let cids = CidChecker::new(vec![
             "bafy2bzaceczhz54xmmz3xqnbmvxfbaty3qprr6dq7xh5vzwqbirlsnbd36z7a",
             "bafy2bzacecxcp736xkl2mcyjlors3tug6vdlbispbzxvb75xlrhthiw2xwxvw",
             "bafy2bzaceczhz54xmmz3xqnbmvxfbaty3qprr6dq7xh5vzwqbirlsnbd36z7a",
+            "bafy2bzaceamp42wmmgr2g2ymg46euououzfyck7szknvfacqscohrvaikwfay",
         ]);
-        super::set_delete_many(HamtFactory::default(), Some(stats), cids);
+        super::set_delete_many(200, HamtFactory::default(), Some(stats), cids);
     }
 
     #[test]
     fn for_each() {
         #[rustfmt::skip]
-        let stats = BSStats {r: 30, w: 30, br: 3209, bw: 3209};
+            let stats = BSStats {r: 30, w: 30, br: 3209, bw: 3209};
         let cids = CidChecker::new(vec![
             "bafy2bzaceczhz54xmmz3xqnbmvxfbaty3qprr6dq7xh5vzwqbirlsnbd36z7a",
             "bafy2bzaceczhz54xmmz3xqnbmvxfbaty3qprr6dq7xh5vzwqbirlsnbd36z7a",
         ]);
-        super::for_each(HamtFactory::default(), Some(stats), cids);
+        super::for_each(200, HamtFactory::default(), Some(stats), cids);
     }
 
     #[test]
     fn for_each_ranged() {
         #[rustfmt::skip]
-        let stats = BSStats {r: 30, w: 30, br: 2895, bw: 2895};
+            let stats = BSStats {r: 30, w: 30, br: 2895, bw: 2895};
         let cids = CidChecker::new(vec![
             "bafy2bzacedy4ypl2vedhdqep3llnwko6vrtfiys5flciz2f3c55pl4whlhlqm",
             "bafy2bzacedy4ypl2vedhdqep3llnwko6vrtfiys5flciz2f3c55pl4whlhlqm",
         ]);
-        super::for_each_ranged(HamtFactory::default(), Some(stats), cids);
+        super::for_each_ranged(200, HamtFactory::default(), Some(stats), cids);
     }
 
     #[test]
@@ -1005,6 +1052,21 @@ mod test_default {
             "bafy2bzacedlyeuub3mo4aweqs7zyxrbldsq2u4a2taswubudgupglu2j4eru6",
         ]);
         super::clean_child_ordering(HamtFactory::default(), Some(stats), cids);
+    }
+
+    #[test]
+    fn test_hamtv0() {
+        let config = Config {
+            bit_width: 5,
+            ..Default::default()
+        };
+        let store = MemoryBlockstore::default();
+        let mut hamtv0: Hamtv0<_, _, usize> = Hamtv0::new_with_config(&store, config.clone());
+        hamtv0.set(1, "world".to_string()).unwrap();
+        assert_eq!(hamtv0.get(&1).unwrap(), Some(&"world".to_string()));
+        let c = hamtv0.flush().unwrap();
+        let new_hamt = Hamtv0::load_with_config(&c, &store, config).unwrap();
+        assert_eq!(hamtv0, new_hamt);
     }
 
     #[quickcheck]
@@ -1078,12 +1140,23 @@ macro_rules! test_hamt_mod {
 
             #[test]
             fn set_delete_many() {
-                super::set_delete_many($factory, None, CidChecker::empty())
+                for s in super::SIZE_FACTORS {
+                    super::set_delete_many(*s, $factory, None, CidChecker::empty())
+                }
             }
 
             #[test]
             fn for_each() {
-                super::for_each($factory, None, CidChecker::empty())
+                for s in super::SIZE_FACTORS {
+                    super::for_each(*s, $factory, None, CidChecker::empty())
+                }
+            }
+
+            #[test]
+            fn for_each_ranged() {
+                for s in super::SIZE_FACTORS {
+                    super::for_each_ranged(*s, $factory, None, CidChecker::empty())
+                }
             }
 
             #[test]

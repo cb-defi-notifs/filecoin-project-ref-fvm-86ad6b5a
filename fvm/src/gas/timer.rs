@@ -1,24 +1,50 @@
+use std::fmt;
 // Copyright 2021-2023 Protocol Labs
 // SPDX-License-Identifier: Apache-2.0, MIT
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use minstant::Instant;
-use once_cell::sync::OnceCell;
 
 /// Shared reference between the duration and the timer.
-type DurationCell = Arc<OnceCell<Duration>>;
+type DurationCell = Arc<OnceLock<Duration>>;
 
 /// Data structure to encapsulate the optional duration which is set by the `GasTimer`.
 ///
 /// This is normally created with an empty inner, because at the point of creation
 /// we don't know if tracing is on or not. It will be filled in later by `GasTimer`.
-#[derive(Default, Debug, Clone)]
-pub struct GasDuration(Option<DurationCell>);
+#[derive(Default, Clone)]
+pub struct GasDuration(GasDurationInner);
+
+#[derive(Default, Clone)]
+pub enum GasDurationInner {
+    #[default]
+    None,
+    Atomic(DurationCell),
+    Constant(Duration),
+}
 
 impl GasDuration {
     pub fn get(&self) -> Option<&Duration> {
-        self.0.as_ref().and_then(|d| d.get())
+        match &self.0 {
+            GasDurationInner::None => None,
+            GasDurationInner::Atomic(d) => d.get(),
+            GasDurationInner::Constant(d) => Some(d),
+        }
+    }
+}
+
+impl From<Duration> for GasDuration {
+    fn from(d: Duration) -> Self {
+        GasDuration(GasDurationInner::Constant(d))
+    }
+}
+
+impl fmt::Debug for GasDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("GasDuration")
+            .field(&self.get() as &dyn fmt::Debug)
+            .finish()
     }
 }
 
@@ -27,7 +53,6 @@ pub type GasInstant = Instant;
 
 /// A handle returned by `charge_gas` which must be used to mark the end of
 /// the execution associated with that gas.
-#[must_use]
 #[derive(Debug)]
 pub struct GasTimer(Option<GasTimerInner>);
 
@@ -54,16 +79,19 @@ impl GasTimer {
     /// Create a new timer that will update the elapsed time of a charge when it's finished.
     ///
     /// As a side effect it will establish the cell in the `GasDuration`, if it has been empty so far.
+    ///
+    /// When compiled in debug mode, passing a "filled" duration will panic.
     pub fn new(duration: &mut GasDuration) -> Self {
-        assert!(duration.get().is_none(), "GasCharge::elapsed already set!");
-
+        debug_assert!(duration.get().is_none(), "GasCharge::elapsed already set!");
         let cell = match &duration.0 {
-            Some(cell) => cell.clone(),
-            None => {
+            GasDurationInner::None => {
                 let cell = DurationCell::default();
-                duration.0 = Some(cell.clone());
+                duration.0 = GasDurationInner::Atomic(cell.clone());
                 cell
             }
+            GasDurationInner::Atomic(cell) if cell.get().is_none() => cell.clone(),
+            // If the duration has already been set, the timer is a no-op.
+            _ => return Self(None),
         };
 
         Self(Some(GasTimerInner {
@@ -86,7 +114,7 @@ impl GasTimer {
         }
     }
 
-    fn set_elapsed(elapsed: Arc<OnceCell<Duration>>, start: GasInstant) {
+    fn set_elapsed(elapsed: Arc<OnceLock<Duration>>, start: GasInstant) {
         elapsed
             .set(start.elapsed())
             .expect("GasCharge::elapsed already set!")

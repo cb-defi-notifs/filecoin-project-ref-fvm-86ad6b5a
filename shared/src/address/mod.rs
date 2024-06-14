@@ -44,16 +44,12 @@ pub const MAX_SUBADDRESS_LEN: usize = 54;
 /// Defines first available ID address after builtin actors
 pub const FIRST_NON_SINGLETON_ADDR: ActorID = 100;
 
-lazy_static::lazy_static! {
-    static ref BLS_ZERO_ADDR_BYTES: [u8; BLS_PUB_LEN] = {
-        let bz_addr = Network::Mainnet.parse_address("f3yaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaby2smx7a");
-        if let Ok(Address {payload: Payload::BLS(pubkey), ..}) = bz_addr {
-            pubkey
-        } else {
-            panic!("failed to parse BLS address from provided BLS_ZERO_ADDR string")
-        }
-    };
-}
+/// The payload bytes of a "zero" BLS key.
+const BLS_ZERO_ADDRESS_BYTES: [u8; BLS_PUB_LEN] = {
+    let mut buf = [0u8; BLS_PUB_LEN];
+    buf[0] = 192;
+    buf
+};
 
 /// Length of the checksum hash for string encodings.
 pub const CHECKSUM_HASH_LEN: usize = 4;
@@ -67,7 +63,7 @@ const TESTNET_PREFIX: &str = "t";
 
 /// Address is the struct that defines the protocol and data payload conversion from either
 /// a public key or value
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "testing", derive(Default))]
 #[cfg_attr(feature = "arb", derive(arbitrary::Arbitrary))]
 pub struct Address {
@@ -137,7 +133,7 @@ impl Address {
 
     pub fn is_bls_zero_address(&self) -> bool {
         match self.payload {
-            Payload::BLS(payload_bytes) => payload_bytes == *BLS_ZERO_ADDR_BYTES,
+            Payload::BLS(payload_bytes) => payload_bytes == BLS_ZERO_ADDRESS_BYTES,
             _ => false,
         }
     }
@@ -229,6 +225,15 @@ impl fmt::Display for Address {
     }
 }
 
+// Manually implement Debug so we print a "real" address.
+impl fmt::Debug for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Address")
+            .field(&format_args!("\"{}\"", self))
+            .finish()
+    }
+}
+
 #[cfg(feature = "arb")]
 impl quickcheck::Arbitrary for Address {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
@@ -238,7 +243,7 @@ impl quickcheck::Arbitrary for Address {
     }
 }
 
-pub(self) fn parse_address(addr: &str) -> Result<(Address, Network), Error> {
+fn parse_address(addr: &str) -> Result<(Address, Network), Error> {
     if addr.len() > MAX_ADDRRESS_TEXT_LEN || addr.len() < 3 {
         return Err(Error::InvalidLength);
     }
@@ -380,11 +385,34 @@ pub(crate) fn from_leb_bytes(bz: &[u8]) -> Result<u64, Error> {
     Ok(id)
 }
 
+/// Returns an address hash for given data
+fn address_hash(ingest: &[u8]) -> [u8; 20] {
+    let digest = blake2b_simd::Params::new()
+        .hash_length(PAYLOAD_HASH_LEN)
+        .to_state()
+        .update(ingest)
+        .finalize();
+
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(digest.as_bytes());
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     // Test cases for FOR-02: https://github.com/ChainSafe/forest/issues/1134
     use crate::address::errors::Error;
     use crate::address::{from_leb_bytes, to_leb_bytes};
+
+    #[test]
+    fn test_debug() {
+        // the address string is dependent on current network state which is set
+        // globally so we need to check against possible valid options
+        let addr_debug_str = format!("{:?}", super::Address::new_id(1));
+        assert!(["Address(\"f01\")", "Address(\"t01\")"]
+            .iter()
+            .any(|&s| s == addr_debug_str));
+    }
 
     #[test]
     fn test_from_leb_bytes_passing() {
@@ -427,17 +455,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Returns an address hash for given data
-fn address_hash(ingest: &[u8]) -> [u8; 20] {
-    let digest = blake2b_simd::Params::new()
-        .hash_length(PAYLOAD_HASH_LEN)
-        .to_state()
-        .update(ingest)
-        .finalize();
-
-    let mut hash = [0u8; 20];
-    hash.copy_from_slice(digest.as_bytes());
-    hash
 }

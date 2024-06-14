@@ -12,11 +12,11 @@ use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::{ErrorNumber, ExitCode};
 use fvm_shared::event::StampedEvent;
 use fvm_shared::sys::BlockId;
-use fvm_shared::{ActorID, MethodNum, METHOD_SEND};
+use fvm_shared::{ActorID, METHOD_SEND};
 use num_traits::Zero;
 
 use super::state_access_tracker::{ActorAccessState, StateAccessTracker};
-use super::{Backtrace, CallManager, InvocationResult, NO_DATA_BLOCK_ID};
+use super::{Backtrace, CallManager, Entrypoint, InvocationResult, NO_DATA_BLOCK_ID};
 use crate::blockstore::DiscardBlockstore;
 use crate::call_manager::backtrace::Frame;
 use crate::call_manager::FinishRet;
@@ -75,6 +75,8 @@ pub struct InnerDefaultCallManager<M: Machine> {
     limits: M::Limiter,
     /// Accumulator for events emitted in this call stack.
     events: EventsAccumulator,
+    /// The actor call stack (ActorID and entrypoint name tuple).
+    actor_call_stack: Vec<(ActorID, &'static str)>,
 }
 
 #[doc(hidden)]
@@ -138,7 +140,7 @@ where
         // different matter.
         //
         // NOTE: Technically, we should be _caching_ the existence of the receiver, so we can skip
-        // this step on `send` and create the target actor immediately. By not doing that, we're not
+        // this step on `call_actor` and create the target actor immediately. By not doing that, we're not
         // being perfectly efficient and are technically under-charging gas. HOWEVER, this behavior
         // cannot be triggered by an actor on-chain, so it's not a concern (for now).
         state_access_tracker.record_lookup_address(&receiver_address);
@@ -159,6 +161,7 @@ where
             limits,
             events: Default::default(),
             state_access_tracker,
+            actor_call_stack: vec![],
         })))
     }
 
@@ -166,11 +169,11 @@ where
         &mut self.limits
     }
 
-    fn send<K>(
+    fn call_actor<K>(
         &mut self,
         from: ActorID,
         to: Address,
-        method: MethodNum,
+        entrypoint: Entrypoint,
         params: Option<Block>,
         value: &TokenAmount,
         gas_limit: Option<Gas>,
@@ -180,13 +183,20 @@ where
         K: Kernel<CallManager = Self>,
     {
         if self.machine.context().tracing {
-            self.trace(ExecutionEvent::Call {
-                from,
-                to,
-                method,
-                params: params.as_ref().map(Into::into),
-                value: value.clone(),
-            });
+            if let Entrypoint::Invoke(method) = &entrypoint {
+                self.trace(ExecutionEvent::Call {
+                    from,
+                    to,
+                    method: *method,
+                    params: params.as_ref().map(Into::into),
+                    value: value.clone(),
+                    gas_limit: std::cmp::min(
+                        gas_limit.unwrap_or(Gas::from_milligas(u64::MAX)).round_up(),
+                        self.gas_tracker.gas_available().round_up(),
+                    ),
+                    read_only,
+                });
+            }
         }
 
         // If a specific gas limit has been requested, push a new limit into the gas tracker.
@@ -195,13 +205,14 @@ where
         }
 
         let mut result = self.with_stack_frame(|s| {
-            s.send_unchecked::<K>(from, to, method, params, value, read_only)
+            s.call_actor_unchecked::<K>(from, to, entrypoint, params, value, read_only)
         });
 
         // If we pushed a limit, pop it.
         if gas_limit.is_some() {
             self.gas_tracker.pop_limit()?;
         }
+
         // If we're not out of gas but the error is "out of gas" (e.g., due to a gas limit), replace
         // the error with an explicit exit code.
         if !self.gas_tracker.gas_available().is_zero()
@@ -213,7 +224,7 @@ where
             })
         }
 
-        if self.machine.context().tracing {
+        if self.machine.context().tracing && matches!(entrypoint, Entrypoint::Invoke(_)) {
             self.trace(match &result {
                 Ok(InvocationResult { exit_code, value }) => {
                     ExecutionEvent::CallReturn(*exit_code, value.as_ref().map(Into::into))
@@ -321,6 +332,10 @@ where
         self.nonce
     }
 
+    fn get_call_stack(&self) -> &[(ActorID, &'static str)] {
+        &self.actor_call_stack
+    }
+
     fn next_actor_address(&self) -> Address {
         // Base the next address on the address specified as the message origin. This lets us use,
         // e.g., an f2 address even if we can't look it up anywhere.
@@ -386,7 +401,7 @@ where
             None => {
                 // We charge for creating the actor (storage) but not for address assignment as the
                 // init actor has already handled that for us.
-                let _ = self.charge_gas(self.price_list().on_create_actor(false))?;
+                self.charge_gas(self.price_list().on_create_actor(false))?;
                 ActorState::new_empty(code_id, delegated_address)
             }
         };
@@ -410,8 +425,7 @@ where
             return Ok(Some(id));
         }
         if !self.state_access_tracker.get_address_lookup_state(address) {
-            let _ = self
-                .gas_tracker
+            self.gas_tracker
                 .apply_charge(self.price_list().on_resolve_address())?;
         }
         let id = self.state_tree().lookup_id(address)?;
@@ -424,8 +438,7 @@ where
     fn get_actor(&self, id: ActorID) -> Result<Option<ActorState>> {
         let access = self.state_access_tracker.get_actor_access_state(id);
         if access < Some(ActorAccessState::Read) {
-            let _ = self
-                .gas_tracker
+            self.gas_tracker
                 .apply_charge(self.price_list().on_actor_lookup())?;
         }
         let actor = self.state_tree().get_actor(id)?;
@@ -436,13 +449,11 @@ where
     fn set_actor(&mut self, id: ActorID, state: ActorState) -> Result<()> {
         let access = self.state_access_tracker.get_actor_access_state(id);
         if access < Some(ActorAccessState::Read) {
-            let _ = self
-                .gas_tracker
+            self.gas_tracker
                 .apply_charge(self.price_list().on_actor_lookup())?;
         }
         if access < Some(ActorAccessState::Updated) {
-            let _ = self
-                .gas_tracker
+            self.gas_tracker
                 .apply_charge(self.price_list().on_actor_update())?;
         }
         self.state_tree_mut().set_actor(id, state);
@@ -453,13 +464,11 @@ where
     fn delete_actor(&mut self, id: ActorID) -> Result<()> {
         let access = self.state_access_tracker.get_actor_access_state(id);
         if access < Some(ActorAccessState::Read) {
-            let _ = self
-                .gas_tracker
+            self.gas_tracker
                 .apply_charge(self.price_list().on_actor_lookup())?;
         }
         if access < Some(ActorAccessState::Updated) {
-            let _ = self
-                .gas_tracker
+            self.gas_tracker
                 .apply_charge(self.price_list().on_actor_update())?;
         }
         self.state_tree_mut().delete_actor(id);
@@ -493,8 +502,9 @@ where
             || syscall_error!(NotFound; "transfer recipient {to} does not exist in state-tree"),
         )?;
 
-        from_actor.deduct_funds(value)?;
-        to_actor.deposit_funds(value);
+        // We've already checked the balances/value, so any errors here are fatal.
+        from_actor.deduct_funds(value).or_fatal()?;
+        to_actor.deposit_funds(value).or_fatal()?;
 
         self.set_actor(from, from_actor)?;
         self.set_actor(to, to_actor)?;
@@ -524,7 +534,7 @@ where
     fn create_actor_from_send(&mut self, addr: &Address, act: ActorState) -> Result<ActorID> {
         // This will charge for the address assignment and the actor storage, but not the actor
         // lookup/update (charged below in `set_actor`).
-        let _ = self.charge_gas(self.price_list().on_create_actor(true))?;
+        self.charge_gas(self.price_list().on_create_actor(true))?;
         let addr_id = self.state_tree_mut().register_new_address(addr)?;
         self.state_access_tracker.record_lookup_address(addr);
 
@@ -567,11 +577,11 @@ where
             syscall_error!(IllegalArgument; "failed to serialize params: {}", e)
         })?;
 
-        self.send_resolved::<K>(
+        self.call_actor_resolved::<K>(
             system_actor::SYSTEM_ACTOR_ID,
             id,
-            fvm_shared::METHOD_CONSTRUCTOR,
-            Some(Block::new(CBOR, params)),
+            Entrypoint::ImplicitConstructor,
+            Some(Block::new(CBOR, params, Vec::new())),
             &TokenAmount::zero(),
             false,
         )?;
@@ -587,12 +597,13 @@ where
         self.create_actor_from_send(addr, state)
     }
 
-    /// Send without checking the call depth.
-    fn send_unchecked<K>(
+    /// Call actor without checking the call depth and/or dealing with transactions. This must _only_ be
+    /// called from `call_actor`.
+    fn call_actor_unchecked<K>(
         &mut self,
         from: ActorID,
         to: Address,
-        method: MethodNum,
+        entrypoint: Entrypoint,
         params: Option<Block>,
         value: &TokenAmount,
         read_only: bool,
@@ -626,15 +637,19 @@ where
             },
         };
 
-        self.send_resolved::<K>(from, to, method, params, value, read_only)
+        self.actor_call_stack.push((to, entrypoint.func_name()));
+        let res = self.call_actor_resolved::<K>(from, to, entrypoint, params, value, read_only);
+        self.actor_call_stack.pop();
+
+        res
     }
 
-    /// Send with resolved addresses.
-    fn send_resolved<K>(
+    /// Call actor with resolved addresses.
+    fn call_actor_resolved<K>(
         &mut self,
         from: ActorID,
         to: ActorID,
-        method: MethodNum,
+        entrypoint: Entrypoint,
         params: Option<Block>,
         value: &TokenAmount,
         read_only: bool,
@@ -647,6 +662,19 @@ where
             .get_actor(to)?
             .ok_or_else(|| syscall_error!(NotFound; "actor does not exist: {}", to))?;
 
+        // We're only tracing explicit "invokes" (no upgrades or implicit constructions, for now) as
+        // we want to be able to pair the invoke with another event in the trace. I.e. call ->
+        // invoke, upgrade -> invoke, construct -> invoke.
+        //
+        // Once we add tracing support for upgrades, we can start recording those actor invocations
+        // as well.
+        if self.machine.context().tracing && matches!(entrypoint, Entrypoint::Invoke(_)) {
+            self.trace(ExecutionEvent::InvokeActor {
+                id: to,
+                state: state.clone(),
+            });
+        }
+
         // Transfer, if necessary.
         if !value.is_zero() {
             let t = self.charge_gas(self.price_list().on_value_transfer())?;
@@ -655,21 +683,32 @@ where
         }
 
         // Abort early if we have a send.
-        if method == METHOD_SEND {
+        if entrypoint.invokes(METHOD_SEND) {
             log::trace!("sent {} -> {}: {}", from, to, &value);
             return Ok(InvocationResult::default());
         }
 
         // Charge the invocation gas.
-        let t = self.charge_gas(self.price_list().on_method_invocation())?;
+        let (param_size, param_link_count) = params
+            .as_ref()
+            .map(|p| (p.size(), p.links().len()))
+            .unwrap_or_default();
+        let t = self.charge_gas(
+            self.price_list()
+                .on_method_invocation(param_size, param_link_count),
+        )?;
 
         // Store the parametrs, and initialize the block registry for the target actor.
         let mut block_registry = BlockRegistry::new();
         let params_id = if let Some(blk) = params {
-            block_registry.put(blk)?
+            block_registry.put_reachable(blk)?
         } else {
             NO_DATA_BLOCK_ID
         };
+
+        // additional_params takes care of adding entrypoint specific params to the block
+        // registry and passing them to wasmtime
+        let additional_params = entrypoint.into_params(&mut block_registry)?;
 
         // Increment invocation count
         self.invocation_count += 1;
@@ -679,12 +718,12 @@ where
         // listed the manifest, and therefore preloaded during system initialization.
         #[cfg(feature = "m2-native")]
         self.engine
-            .prepare_actor_code(&state.code, self.blockstore())
+            .preload(&state.code, self.blockstore())
             .map_err(
                 |_| syscall_error!(NotFound; "actor code cid does not exist {}", &state.code),
             )?;
 
-        log::trace!("calling {} -> {}::{}", from, to, method);
+        log::trace!("calling {} -> {}::{}", from, to, entrypoint);
         self.map_mut(|cm| {
             let engine = cm.engine.clone(); // reference the RC.
 
@@ -694,7 +733,7 @@ where
                 block_registry,
                 from,
                 to,
-                method,
+                entrypoint.method_num(),
                 value.clone(),
                 read_only,
             );
@@ -704,9 +743,10 @@ where
 
             // From this point on, there are no more syscall errors, only aborts.
             let result: std::result::Result<BlockId, Abort> = (|| {
+                let code = &state.code;
                 // Instantiate the module.
                 let instance = engine
-                    .instantiate(&mut store, &state.code)?
+                    .instantiate(&mut store, code)?
                     .context("actor not found")
                     .map_err(Abort::Fatal)?;
 
@@ -718,18 +758,26 @@ where
 
                 store.data_mut().memory = memory;
 
-                // Lookup the invoke method.
-                let invoke: wasmtime::TypedFunc<(u32,), u32> = instance
-                    .get_typed_func(&mut store, "invoke")
-                    // All actors will have an invoke method.
-                    .map_err(Abort::Fatal)?;
+                let func = match instance.get_func(&mut store, entrypoint.func_name()) {
+                    Some(func) => func,
+                    None => {
+                        return Err(Abort::Exit(
+                            ExitCode::SYS_INVALID_RECEIVER,
+                            format!("cannot upgrade to {code}"),
+                            0,
+                        ));
+                    }
+                };
+
+                let mut params = vec![wasmtime::Val::I32(params_id as i32)];
+                params.extend_from_slice(additional_params.as_slice());
 
                 // Set the available gas.
                 update_gas_available(&mut store)?;
 
-                // Invoke it.
+                let mut out = [wasmtime::Val::I32(0)];
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    invoke.call(&mut store, (params_id,))
+                    func.call(&mut store, params.as_slice(), &mut out)
                 }))
                 .map_err(|panic| Abort::Fatal(anyhow!("panic within actor: {:?}", panic)))?;
 
@@ -741,7 +789,10 @@ where
                 // detected it and returned OutOfGas above. Any other invocation failure is returned
                 // here as an Abort
 
-                Ok(res?)
+                match res {
+                    Ok(_) => Ok(out[0].unwrap_i32() as u32),
+                    Err(e) => Err(e.into()),
+                }
             })();
 
             let invocation_data = store.into_data();
@@ -765,7 +816,7 @@ where
             });
 
             // Process the result, updating the backtrace if necessary.
-            let ret = match result {
+            let mut ret = match result {
                 Ok(ret) => Ok(InvocationResult {
                     exit_code: ExitCode::OK,
                     value: ret.cloned(),
@@ -808,21 +859,45 @@ where
                     };
 
                     if !code.is_success() {
-                        if let Some(err) = last_error {
-                            cm.backtrace.begin(err);
-                        }
+                        // Only record backtrace frames for explicit messages sent by the user. We
+                        // may want to record frames for failed upgrades, but that complicates
+                        // things a bit and I'd like to keep this API the same for now.
+                        if let &Entrypoint::Invoke(method) = &entrypoint {
+                            if let Some(err) = last_error {
+                                cm.backtrace.begin(err);
+                            }
 
-                        cm.backtrace.push_frame(Frame {
-                            source: to,
-                            method,
-                            message,
-                            code,
-                        });
+                            cm.backtrace.push_frame(Frame {
+                                source: to,
+                                method,
+                                message,
+                                code,
+                            });
+                        }
                     }
 
                     res
                 }
             };
+
+            // Charge for the return value if we're returning to the chain itself. In the (near)
+            // future, we'll charge for internal returns as well (to charge for link tracking).
+            // Unfortunately, we have to do this _here_ instead of in the caller as we need to apply
+            // the call's gas limit.
+            if let Some((ret_size, link_count)) = ret
+                .as_ref()
+                .ok()
+                .and_then(|r| r.value.as_ref())
+                .map(|v| (v.size(), v.links().len()))
+            {
+                if let Err(e) = cm.charge_gas(cm.price_list().on_method_return(
+                    cm.call_stack_depth,
+                    ret_size,
+                    link_count,
+                )) {
+                    ret = Err(e);
+                }
+            }
 
             // Log the results if tracing is enabled.
             if log::log_enabled!(log::Level::Trace) {
@@ -830,11 +905,11 @@ where
                     Ok(val) => log::trace!(
                         "returning {}::{} -> {} ({})",
                         to,
-                        method,
+                        entrypoint,
                         from,
                         val.exit_code
                     ),
-                    Err(e) => log::trace!("failing {}::{} -> {} (err:{})", to, method, from, e),
+                    Err(e) => log::trace!("failing {}::{} -> {} (err:{})", to, entrypoint, from, e),
                 }
             }
 
@@ -860,15 +935,14 @@ where
         F: FnOnce(&mut Self) -> Result<V>,
     {
         if self.call_stack_depth >= self.machine.context().max_call_depth {
-            let sys_err = syscall_error!(LimitExceeded, "message execution exceeds call depth");
-            if self.machine.context().tracing {
-                self.trace(ExecutionEvent::CallError(sys_err.clone()));
-            }
-            return Err(sys_err.into());
+            return Err(
+                syscall_error!(LimitExceeded, "message execution exceeds call depth").into(),
+            );
         }
 
         self.call_stack_depth += 1;
-        let res = <<<DefaultCallManager<M> as CallManager>::Machine as Machine>::Limiter>::with_stack_frame(
+        let res =
+        <<<DefaultCallManager<M> as CallManager>::Machine as Machine>::Limiter>::with_stack_frame(
             self,
             |s| s.limiter_mut(),
             f,
@@ -883,10 +957,19 @@ where
 /// If an actor aborts, the last layer should be discarded (discard_last_layer). This will also
 /// throw away any events collected from subcalls (and previously merged, as those subcalls returned
 /// normally).
-#[derive(Default)]
 pub struct EventsAccumulator {
     events: Vec<StampedEvent>,
     idxs: Vec<usize>,
+}
+impl Default for EventsAccumulator {
+    fn default() -> Self {
+        // Pre-allocate some space here for more consistent performance. We only do this once per
+        // message so the overhead is minimal.
+        Self {
+            events: Vec::with_capacity(128),
+            idxs: Vec::with_capacity(8),
+        }
+    }
 }
 
 pub(crate) struct Events {
@@ -928,7 +1011,7 @@ impl EventsAccumulator {
             let root = Amt::new_from_iter_with_bit_width(
                 DiscardBlockstore,
                 EVENTS_AMT_BITWIDTH,
-                self.events.iter().cloned(),
+                self.events.iter(),
             )
             .context("failed to construct events AMT")
             .or_fatal()?;

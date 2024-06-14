@@ -1,6 +1,5 @@
 // Copyright 2021-2023 Protocol Labs
 // SPDX-License-Identifier: Apache-2.0, MIT
-use core::option::Option;
 use std::ptr; // no_std
 
 use cid::Cid;
@@ -104,6 +103,26 @@ pub fn create_actor(
             .map(|v| (v.as_ptr(), v.len()))
             .unwrap_or((ptr::null(), 0));
         sys::actor::create_actor(actor_id, cid.as_ptr(), addr_off, addr_len as u32)
+    }
+}
+
+/// Upgrades an actor using the given block which includes the old code cid and the upgrade params
+#[cfg(feature = "upgrade-actor")]
+pub fn upgrade_actor(
+    new_code_cid: &Cid,
+    params: Option<fvm_ipld_encoding::ipld_block::IpldBlock>,
+) -> SyscallResult<fvm_shared::Response> {
+    use crate::{build_response, NO_DATA_BLOCK_ID};
+    unsafe {
+        let cid = new_code_cid.to_bytes();
+
+        let params_id = match params {
+            Some(p) => sys::ipld::block_create(p.codec, p.data.as_ptr(), p.data.len() as u32)?,
+            None => NO_DATA_BLOCK_ID,
+        };
+
+        let send = sys::actor::upgrade_actor(cid.as_ptr(), params_id)?;
+        build_response(send)
     }
 }
 

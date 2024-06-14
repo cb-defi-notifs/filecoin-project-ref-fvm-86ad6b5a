@@ -15,12 +15,16 @@ pub enum Method {
     OnBlock,
     /// Try (and fail) to verify random data with a public key and signature.
     OnVerifySignature,
+    /// Try to validate BLS aggregates (correctly).
+    OnVerifyBlsAggregate,
     /// Try (and fail) to recovery a public key from a signature, using random data.
     OnRecoverSecpPublicKey,
     /// Measure sends
     OnSend,
-    /// Emit events, driven by the selected mode. See EventCalibrationMode for more info.
+    /// Emit events
     OnEvent,
+    /// Read/write blocks with different numbers of CBOR fields & links.
+    OnScanIpldLinks,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +56,14 @@ pub struct OnVerifySignatureParams {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct OnVerifyBlsAggregateParams {
+    pub iterations: usize,
+    pub signature: Vec<u8>,
+    pub keys: Vec<Vec<u8>>,
+    pub messages: Vec<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct OnRecoverSecpPublicKeyParams {
     pub iterations: usize,
     /// Size doesn't play a role with the SDK call because it works on hashes,
@@ -63,17 +75,10 @@ pub struct OnRecoverSecpPublicKeyParams {
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum EventCalibrationMode {
-    /// Produce events with the specified shape.
-    Shape((usize, usize, usize)),
-    /// Attempt to reach a target size for the CBOR event.
-    TargetSize(usize),
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct OnEventParams {
     pub iterations: usize,
-    pub mode: EventCalibrationMode,
+    // Total size of the values.
+    pub total_value_size: usize,
     /// Number of entries in the event.
     pub entries: usize,
     /// Flags to apply to all entries.
@@ -99,4 +104,12 @@ impl OnHashingParams {
             _ => None,
         }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct OnScanIpldLinksParams {
+    pub iterations: usize,
+    pub cbor_link_count: usize,
+    pub cbor_field_count: usize,
+    pub seed: u64,
 }

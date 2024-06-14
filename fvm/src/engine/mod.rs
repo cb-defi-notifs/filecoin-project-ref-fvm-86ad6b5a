@@ -7,7 +7,6 @@ mod instance_pool;
 use std::any::{Any, TypeId};
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context};
@@ -18,8 +17,8 @@ use fvm_wasm_instrument::gas_metering::GAS_COUNTER_NAME;
 use num_traits::Zero;
 use wasmtime::OptLevel::Speed;
 use wasmtime::{
-    Global, GlobalType, InstanceAllocationStrategy, Linker, Memory, MemoryType, Module, Mutability,
-    Val, ValType,
+    Global, GlobalType, InstanceAllocationStrategy, Memory, MemoryType, Module, Mutability, Val,
+    ValType, WasmBacktraceDetails,
 };
 
 use crate::gas::{Gas, GasTimer, WasmGasPrices};
@@ -27,8 +26,8 @@ use crate::machine::limiter::MemoryLimiter;
 use crate::machine::{Machine, NetworkConfig};
 use crate::syscalls::error::Abort;
 use crate::syscalls::{
-    bind_syscalls, charge_for_exec, charge_for_init, record_init_time, update_gas_available,
-    InvocationData,
+    charge_for_exec, charge_for_init, record_init_time, update_gas_available, InvocationData,
+    Linker,
 };
 use crate::Kernel;
 
@@ -39,7 +38,7 @@ use self::instance_pool::InstancePool;
 /// concurrency level.
 const EXPECTED_MAX_STACK_DEPTH: u32 = 20;
 
-/// Container managing engines with different consensus-affecting configurations.
+/// Container managing [`Engine`]s with different consensus-affecting configurations.
 pub struct MultiEngine {
     engines: Mutex<HashMap<EngineConfig, EnginePool>>,
     concurrency: u32,
@@ -83,6 +82,8 @@ impl From<&NetworkConfig> for EngineConfig {
 }
 
 impl MultiEngine {
+    /// Create a new "multi-engine" with the given concurrency limit. The concurrency limit is
+    /// per-configuration, not global.
     pub fn new(concurrency: u32) -> MultiEngine {
         if concurrency == 0 {
             panic!("concurrency must be positive");
@@ -93,6 +94,8 @@ impl MultiEngine {
         }
     }
 
+    /// Get an [`EnginePool`] for the given [`NetworkConfig`], creating one if it doesn't already
+    /// exist.
     pub fn get(&self, nc: &NetworkConfig) -> anyhow::Result<EnginePool> {
         let mut engines = self
             .engines
@@ -104,7 +107,7 @@ impl MultiEngine {
 
         let pool = match engines.entry(ec.clone()) {
             Occupied(entry) => entry.into_mut(),
-            Vacant(entry) => entry.insert(EnginePool::new_default(ec)?),
+            Vacant(entry) => entry.insert(EnginePool::new(ec)?),
         };
 
         Ok(pool.clone())
@@ -117,6 +120,7 @@ impl Default for MultiEngine {
     }
 }
 
+/// Derive a [`wasmtime::Config`] from an [`EngineConfig`]
 fn wasmtime_config(ec: &EngineConfig) -> anyhow::Result<wasmtime::Config> {
     if ec.concurrency < 1 {
         return Err(anyhow!("concurrency limit must not be 0"));
@@ -138,13 +142,16 @@ fn wasmtime_config(ec: &EngineConfig) -> anyhow::Result<wasmtime::Config> {
     // We want to pre-allocate all permissible memory to support the maximum allowed recursion limit.
 
     let mut alloc_strat_cfg = wasmtime::PoolingAllocationConfig::default();
-    alloc_strat_cfg.instance_count(instance_count);
+    alloc_strat_cfg.total_core_instances(instance_count);
+    alloc_strat_cfg.total_memories(instance_count);
+    alloc_strat_cfg.max_memories_per_module(1);
+    alloc_strat_cfg.total_tables(instance_count);
+    alloc_strat_cfg.max_tables_per_module(1);
 
     // Adjust the maximum amount of host memory that can be committed to an instance to
     // match the static linear memory size we reserve for each slot.
-    alloc_strat_cfg.instance_memory_pages(
-        instance_memory_maximum_size / (wasmtime_environ::WASM_PAGE_SIZE as u64),
-    );
+    alloc_strat_cfg
+        .memory_pages(instance_memory_maximum_size / (wasmtime_environ::WASM_PAGE_SIZE as u64));
     c.allocation_strategy(InstanceAllocationStrategy::Pooling(alloc_strat_cfg));
 
     // wasmtime default: true
@@ -153,17 +160,25 @@ fn wasmtime_config(ec: &EngineConfig) -> anyhow::Result<wasmtime::Config> {
 
     // wasmtime default: 4GB
     c.static_memory_maximum_size(instance_memory_maximum_size);
+    c.static_memory_forced(true);
 
-    // wasmtime default: false
-    // We don't want threads, there is no way to ensure determisism
+    // wasmtime default: true
+    // We don't want threads, there is no way to ensure determinism
     c.wasm_threads(false);
 
     // wasmtime default: true
-    // simd isn't supported in wasm-instrument, but if we add support there, we can probably enable this.
+    // simd isn't supported in wasm-instrument, but if we add support there, we can probably enable
+    // this.
     // Note: stack limits may need adjusting after this is enabled
     c.wasm_simd(false);
+    c.wasm_relaxed_simd(false);
+    c.relaxed_simd_deterministic(true);
 
     // wasmtime default: false
+    // We don't support the return_call_* functions.
+    c.wasm_tail_call(false);
+
+    // wasmtime default: true
     c.wasm_multi_memory(false);
 
     // wasmtime default: false
@@ -178,6 +193,16 @@ fn wasmtime_config(ec: &EngineConfig) -> anyhow::Result<wasmtime::Config> {
     // we should be able to enable this for M2, just need to make sure that it's
     // handled correctly in wasm-instrument
     c.wasm_multi_value(false);
+
+    // wasmtime default: false
+    // Cool proposal to allow function references, but we don't support it yet.
+    #[cfg(feature = "wasmtime/gc")]
+    c.wasm_function_references(false);
+
+    // wasmtime default: false
+    // Wasmtime function reference proposal.
+    #[cfg(feature = "wasmtime/gc")]
+    c.wasm_gc(false);
 
     // wasmtime default: false
     //
@@ -204,13 +229,16 @@ fn wasmtime_config(ec: &EngineConfig) -> anyhow::Result<wasmtime::Config> {
     c.generate_address_map(false);
     c.cranelift_debug_verifier(false);
     c.native_unwind_info(false);
-    #[allow(deprecated)] // TODO https://github.com/bytecodealliance/wasmtime/issues/5037
     c.wasm_backtrace(false);
-    c.wasm_reference_types(false);
+    c.wasm_backtrace_details(WasmBacktraceDetails::Disable);
 
     // Reiterate some defaults
     c.guard_before_linear_memory(true);
     c.parallel_compilation(true);
+
+    // Disable caching if some other crate enables it. We do our own caching.
+    #[cfg(feature = "wasmtime/cache")]
+    c.disable_cache();
 
     #[cfg(feature = "wasmtime/async")]
     c.async_support(false);
@@ -264,13 +292,10 @@ impl EnginePool {
         }
     }
 
-    pub fn new_default(ec: EngineConfig) -> anyhow::Result<Self> {
-        EnginePool::new(&wasmtime_config(&ec)?, ec)
-    }
-
-    /// Create a new Engine from a wasmtime config.
-    pub fn new(c: &wasmtime::Config, ec: EngineConfig) -> anyhow::Result<Self> {
-        let engine = wasmtime::Engine::new(c)?;
+    /// Create a new [`EnginePool`].
+    pub fn new(ec: EngineConfig) -> anyhow::Result<Self> {
+        let c = wasmtime_config(&ec)?;
+        let engine = wasmtime::Engine::new(&c)?;
 
         let mut dummy_store = wasmtime::Store::new(&engine, ());
         let gg_type = GlobalType::new(ValType::I64, Mutability::Var);
@@ -309,14 +334,7 @@ pub struct Engine {
     inner: Arc<EngineInner>,
 }
 
-impl Deref for Engine {
-    type Target = wasmtime::Engine;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner.engine
-    }
-}
-
+/// Release the engine back into the [`EnginePool`].
 impl Drop for Engine {
     fn drop(&mut self) {
         self.inner.concurrency_limit.release();
@@ -329,29 +347,26 @@ impl Engine {
     /// method errors if the code CID is not found in the store.
     ///
     /// Return the original byte code size.
-    pub fn prepare_actor_code<BS: Blockstore>(
-        &self,
-        code_cid: &Cid,
-        blockstore: BS,
-    ) -> anyhow::Result<usize> {
+    pub fn preload(&self, code_cid: &Cid, blockstore: &impl Blockstore) -> anyhow::Result<usize> {
         let code_cid = self.with_redirect(code_cid);
-        if let Some(item) = self
+        match self
             .inner
             .module_cache
             .lock()
             .expect("module_cache poisoned")
-            .get(code_cid)
+            .entry(*code_cid)
         {
-            return Ok(item.size);
+            Occupied(e) => Ok(e.get().size),
+            Vacant(e) => {
+                let wasm = blockstore.get(code_cid)?.ok_or_else(|| {
+                    anyhow!(
+                        "no wasm bytecode in blockstore for CID {}",
+                        &code_cid.to_string()
+                    )
+                })?;
+                Ok(e.insert(self.load_raw(&wasm)?).size)
+            }
         }
-        let wasm = blockstore.get(code_cid)?.ok_or_else(|| {
-            anyhow!(
-                "no wasm bytecode in blockstore for CID {}",
-                &code_cid.to_string()
-            )
-        })?;
-        // compile and cache instantiated WASM module
-        self.prepare_wasm_bytecode(code_cid, &wasm)
     }
 
     /// Instantiates and caches the Wasm modules for the bytecodes addressed by
@@ -360,15 +375,15 @@ impl Engine {
     /// make this method return an Err immediately.
     ///
     /// Returns the total original byte size of the modules
-    pub fn preload<'a, BS, I>(&self, blockstore: BS, cids: I) -> anyhow::Result<usize>
-    where
-        BS: Blockstore,
-        I: IntoIterator<Item = &'a Cid>,
-    {
+    pub fn preload_all<'a>(
+        &self,
+        blockstore: &impl Blockstore,
+        cids: impl IntoIterator<Item = &'a Cid>,
+    ) -> anyhow::Result<usize> {
         let mut total_size = 0usize;
         for cid in cids {
             log::trace!("preloading code CID {cid}");
-            let size = self.prepare_actor_code(cid, &blockstore).with_context(|| {
+            let size = self.preload(cid, &blockstore).with_context(|| {
                 anyhow!("could not prepare actor with code CID {}", &cid.to_string())
             })?;
             total_size += size;
@@ -376,6 +391,7 @@ impl Engine {
         Ok(total_size)
     }
 
+    /// Translate the passed CID with a "redirected" CID in case the code has been replaced.
     fn with_redirect<'a>(&'a self, k: &'a Cid) -> &'a Cid {
         match &self.inner.actor_redirect.get(k) {
             Some(cid) => cid,
@@ -383,26 +399,7 @@ impl Engine {
         }
     }
 
-    /// Loads some Wasm code into the engine and prepares it for execution.
-    pub fn prepare_wasm_bytecode(&self, k: &Cid, wasm: &[u8]) -> anyhow::Result<usize> {
-        let k = self.with_redirect(k);
-        let mut cache = self
-            .inner
-            .module_cache
-            .lock()
-            .expect("module_cache poisoned");
-        let size = match cache.get(k) {
-            Some(item) => item.size,
-            None => {
-                let m = self.load_raw(wasm)?;
-                let s = m.size;
-                cache.insert(*k, m);
-                s
-            }
-        };
-        Ok(size)
-    }
-
+    /// Load the specified wasm module with the internal Engine instance.
     fn load_raw(&self, raw_wasm: &[u8]) -> anyhow::Result<ModuleRecord> {
         // First make sure that non-instrumented wasm is valid
         Module::validate(&self.inner.engine, raw_wasm)
@@ -448,7 +445,8 @@ impl Engine {
     /// # Safety
     ///
     /// See [`wasmtime::Module::deserialize`] for safety information.
-    pub unsafe fn load_compiled(&self, k: &Cid, compiled: &[u8]) -> anyhow::Result<Module> {
+    #[allow(dead_code)]
+    unsafe fn load_compiled(&self, k: &Cid, compiled: &[u8]) -> anyhow::Result<Module> {
         let k = self.with_redirect(k);
         let mut cache = self
             .inner
@@ -472,34 +470,11 @@ impl Engine {
         Ok(module)
     }
 
-    /// Lookup a loaded wasmtime module.
-    pub fn get_module(
-        &self,
-        blockstore: &impl Blockstore,
-        k: &Cid,
-    ) -> anyhow::Result<Option<Module>> {
-        let k = self.with_redirect(k);
-        match self
-            .inner
-            .module_cache
-            .lock()
-            .expect("module_cache poisoned")
-            .entry(*k)
-        {
-            Occupied(v) => Ok(Some(v.get().module.clone())),
-            Vacant(v) => blockstore
-                .get(k)
-                .context("failed to lookup wasm module in blockstore")?
-                .map(|raw_wasm| Ok(v.insert(self.load_raw(&raw_wasm)?).module.clone()))
-                .transpose(),
-        }
-    }
-
     /// Lookup and instantiate a loaded wasmtime module with the given store. This will cache the
     /// linker, syscalls, etc.
     ///
     /// This returns an `Abort` as it may need to execute initialization code, charge gas, etc.
-    pub fn instantiate<K: Kernel>(
+    pub(crate) fn instantiate<K: Kernel>(
         &self,
         store: &mut wasmtime::Store<InvocationData<K>>,
         k: &Cid,
@@ -515,11 +490,10 @@ impl Engine {
                 .expect("invalid instance cache entry"),
             Vacant(e) => &mut *e
                 .insert({
-                    let mut linker: Linker<InvocationData<K>> = Linker::new(&self.inner.engine);
-                    linker.allow_shadowing(true);
-
-                    bind_syscalls(&mut linker).map_err(Abort::Fatal)?;
-                    Box::new(Cache { linker })
+                    let mut linker = Linker(wasmtime::Linker::new(&self.inner.engine));
+                    linker.0.allow_shadowing(true);
+                    K::link_syscalls(&mut linker).map_err(Abort::Fatal)?;
+                    Box::new(Cache { linker: linker.0 })
                 })
                 .downcast_mut()
                 .expect("invalid instance cache entry"),
@@ -598,7 +572,7 @@ impl Engine {
     }
 
     /// Construct a new wasmtime "store" from the given kernel.
-    pub fn new_store<K: Kernel>(&self, mut kernel: K) -> wasmtime::Store<InvocationData<K>> {
+    pub(crate) fn new_store<K: Kernel>(&self, mut kernel: K) -> wasmtime::Store<InvocationData<K>> {
         // Take a new instance and put it into a drop-guard that removes the reservation when
         // we're done.
         #[must_use]
@@ -623,6 +597,7 @@ impl Engine {
             last_memory_bytes: memory_bytes,
             last_charge_time: GasTimer::start(),
             memory: self.inner.dummy_memory,
+            wasm_prices: self.inner.config.wasm_prices,
         };
 
         let mut store = wasmtime::Store::new(&self.inner.engine, id);

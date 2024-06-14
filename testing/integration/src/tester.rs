@@ -8,7 +8,7 @@ use fvm::executor::DefaultExecutor;
 use fvm::externs::Externs;
 use fvm::machine::{DefaultMachine, Machine, MachineContext, NetworkConfig};
 use fvm::state_tree::{ActorState, StateTree};
-use fvm::{init_actor, system_actor, DefaultKernel};
+use fvm::{init_actor, system_actor};
 use fvm_ipld_blockstore::{Block, Blockstore, MemoryBlockstore};
 use fvm_ipld_encoding::{ser, CborStore};
 use fvm_shared::address::{Address, Protocol};
@@ -20,7 +20,10 @@ use lazy_static::lazy_static;
 use libsecp256k1::{PublicKey, SecretKey};
 use multihash::Code;
 
-use crate::builtin::{fetch_builtin_code_cid, set_eam_actor, set_init_actor, set_sys_actor};
+use crate::builtin::{
+    fetch_builtin_code_cid, set_burnt_funds_account, set_eam_actor, set_init_actor, set_sys_actor,
+};
+use crate::custom_kernel::DefaultCustomKernel;
 use crate::dummy::DummyExterns;
 use crate::error::Error::{FailedToFlushTree, NoManifestInformation};
 
@@ -33,7 +36,7 @@ lazy_static! {
 pub trait Store: Blockstore + Sized + 'static {}
 
 pub type IntegrationExecutor<B, E> =
-    DefaultExecutor<DefaultKernel<DefaultCallManager<DefaultMachine<B, E>>>>;
+    DefaultExecutor<DefaultCustomKernel<DefaultCallManager<DefaultMachine<B, E>>>>;
 
 pub type Account = (ActorID, Address);
 
@@ -96,10 +99,11 @@ where
         let init_state = init_actor::State::new_test(&blockstore);
         let mut state_tree = StateTree::new(blockstore, stv).map_err(anyhow::Error::from)?;
 
-        // Deploy init, sys, and eam actors
+        // Deploy init, sys, burn, and eam actors
         let sys_state = system_actor::State { builtin_actors };
         set_sys_actor(&mut state_tree, sys_state, sys_code_cid)?;
         set_init_actor(&mut state_tree, init_code_cid, init_state)?;
+        set_burnt_funds_account(&mut state_tree, accounts_code_cid)?;
         set_eam_actor(&mut state_tree, eam_code_cid)?;
 
         Ok(Tester {
@@ -288,15 +292,14 @@ where
         // Custom configuration.
         configure_mc(&mut mc);
 
-        let engine = EnginePool::new_default((&mc.network.clone()).into())?;
-        engine.acquire().preload(&blockstore, &self.code_cids)?;
+        let engine = EnginePool::new((&mc.network.clone()).into())?;
+        engine.acquire().preload_all(&blockstore, &self.code_cids)?;
 
         let machine = DefaultMachine::new(&mc, blockstore, externs)?;
 
-        let executor =
-            DefaultExecutor::<DefaultKernel<DefaultCallManager<DefaultMachine<B, E>>>>::new(
-                engine, machine,
-            )?;
+        let executor = DefaultExecutor::<
+            DefaultCustomKernel<DefaultCallManager<DefaultMachine<B, E>>>,
+        >::new(engine, machine)?;
 
         self.executor = Some(executor);
         self.ready = true;
@@ -366,7 +369,7 @@ impl BasicTester {
             };
 
         let mut tester = Tester::new(
-            NetworkVersion::V18,
+            NetworkVersion::V20,
             StateTreeVersion::V5,
             bundle_cid,
             blockstore,

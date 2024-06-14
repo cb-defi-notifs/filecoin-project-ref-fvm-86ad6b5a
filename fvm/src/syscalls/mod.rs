@@ -2,34 +2,44 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 use anyhow::{anyhow, Context as _};
 use num_traits::Zero;
-use wasmtime::{AsContextMut, ExternType, Global, Linker, Memory, Module, Val};
+use wasmtime::{AsContext, AsContextMut, ExternType, Global, Module, Val};
 
 use crate::call_manager::backtrace;
-use crate::gas::{Gas, GasInstant, GasTimer};
-use crate::kernel::ExecutionError;
+use crate::gas::{Gas, GasInstant, GasTimer, WasmGasPrices};
+use crate::kernel::filecoin::{DefaultFilecoinKernel, FilecoinKernel};
+use crate::kernel::{
+    ActorOps, CryptoOps, DebugOps, EventOps, ExecutionError, IpldBlockOps, MessageOps, NetworkOps,
+    RandomnessOps, SelfOps, SendOps, SyscallHandler, UpgradeOps,
+};
+
 use crate::machine::limiter::MemoryLimiter;
-use crate::Kernel;
+use crate::{DefaultKernel, Kernel};
 
 pub(crate) mod error;
 
 mod actor;
-mod bind;
 mod context;
 mod crypto;
 mod debug;
 mod event;
+mod filecoin;
 mod gas;
 mod ipld;
+mod linker;
 mod network;
 mod rand;
 mod send;
 mod sself;
 mod vm;
 
-pub(self) use context::Context;
+pub use context::{Context, Memory};
+pub use error::Abort;
+pub use linker::{ControlFlow, Linker};
+
+pub use linker::{IntoControlFlow, Syscall};
 
 /// Invocation data attached to a wasm "store" and available to the syscall binding.
-pub struct InvocationData<K> {
+pub(crate) struct InvocationData<K> {
     /// The kernel on which this actor is being executed.
     pub kernel: K,
 
@@ -54,12 +64,14 @@ pub struct InvocationData<K> {
     pub last_charge_time: GasInstant,
 
     /// The invocation's imported "memory".
-    pub memory: Memory,
+    pub memory: wasmtime::Memory,
+
+    pub wasm_prices: &'static WasmGasPrices,
 }
 
 /// Updates the global available gas in the Wasm module after a syscall, to account for any
 /// gas consumption that happened on the host side.
-pub fn update_gas_available(
+pub(crate) fn update_gas_available(
     ctx: &mut impl AsContextMut<Data = InvocationData<impl Kernel>>,
 ) -> Result<(), Abort> {
     let mut ctx = ctx.as_context_mut();
@@ -89,7 +101,7 @@ pub fn update_gas_available(
 }
 
 /// Updates the FVM-side gas tracker with newly accrued execution gas charges.
-pub fn charge_for_exec<K: Kernel>(
+pub(crate) fn charge_for_exec<K: Kernel>(
     ctx: &mut impl AsContextMut<Data = InvocationData<K>>,
 ) -> Result<(), Abort> {
     let mut ctx = ctx.as_context_mut();
@@ -126,7 +138,7 @@ pub fn charge_for_exec<K: Kernel>(
     let memory_bytes = data.kernel.limiter_mut().memory_used();
     let memory_delta_bytes = memory_bytes.saturating_sub(data.last_memory_bytes);
 
-    let mut memory_gas_charge = data.kernel.price_list().grow_memory_gas(memory_delta_bytes);
+    let mut memory_gas_charge = data.wasm_prices.grow_memory_gas(memory_delta_bytes);
     if memory_gas_charge <= exec_gas_charge {
         exec_gas_charge -= memory_gas_charge;
     } else {
@@ -142,7 +154,7 @@ pub fn charge_for_exec<K: Kernel>(
         .map_err(Abort::from_error_as_fatal)?;
 
     // It should be okay to record time associated with Wasm execution because `charge_for_exec` is
-    // called before syscalls `impl_bind_syscalls`, so the syscall timings are going to be
+    // called before syscalls `impl_link_syscalls`, so the syscall timings are going to be
     // interleaved, rather than nested inside it. But we also have to make sure to reset the timer
     // after each syscall, when Wasm resumes, which happens in `update_gas_available`.
     t.stop_with(data.last_charge_time);
@@ -151,12 +163,21 @@ pub fn charge_for_exec<K: Kernel>(
         // Only recording time for the execution, not for the memory part, which is unknown. But we
         // could perform stomething like a multi-variate linear regression to see if the amount of
         // memory explains any of the exectuion time.
-        let _ = data
-            .kernel
+        data.kernel
             .charge_gas("wasm_memory_grow", memory_gas_charge)
             .map_err(Abort::from_error_as_fatal)?;
     }
 
+    Ok(())
+}
+
+pub(crate) fn charge_syscall_gas(
+    ctx: &mut impl AsContext<Data = InvocationData<impl Kernel>>,
+) -> Result<(), Abort> {
+    let data = ctx.as_context().data();
+    data.kernel
+        .charge_gas("OnSyscall", data.wasm_prices.host_call_cost)
+        .map_err(Abort::from_error_as_fatal)?;
     Ok(())
 }
 
@@ -165,21 +186,21 @@ pub fn charge_for_exec<K: Kernel>(
 /// The Wasm instrumentation machinery via [fvm_wasm_instrument::gas_metering::MemoryGrowCost]
 /// only charges for growing the memory _beyond_ the initial amount. It's up to us to make sure
 /// the minimum memory is properly charged for.
-pub fn charge_for_init<K: Kernel>(
+pub(crate) fn charge_for_init<K: Kernel>(
     ctx: &mut impl AsContextMut<Data = InvocationData<K>>,
     module: &Module,
 ) -> crate::kernel::Result<GasTimer> {
     let min_memory_bytes = min_memory_bytes(module)?;
     let mut ctx = ctx.as_context_mut();
-    let mut data = ctx.data_mut();
-    let memory_gas = data.kernel.price_list().init_memory_gas(min_memory_bytes);
+    let data = ctx.data_mut();
+    let memory_gas = data.wasm_prices.init_memory_gas(min_memory_bytes);
 
     // Adjust `last_memory_bytes` so that we don't charge for it again in `charge_for_exec`.
     data.last_memory_bytes += min_memory_bytes;
 
     if let Some(min_table_elements) = min_table_elements(module) {
-        let table_gas = data.kernel.price_list().init_table_gas(min_table_elements);
-        let _ = data.kernel.charge_gas("wasm_table_init", table_gas)?;
+        let table_gas = data.wasm_prices.init_table_gas(min_table_elements);
+        data.kernel.charge_gas("wasm_table_init", table_gas)?;
     }
 
     data.kernel.charge_gas("wasm_memory_init", memory_gas)
@@ -189,7 +210,7 @@ pub fn charge_for_init<K: Kernel>(
 ///
 /// In practice this includes all the time elapsed since the `InvocationData` was created,
 /// ie. this is the first time we'll use the `last_charge_time`.
-pub fn record_init_time<K: Kernel>(
+pub(crate) fn record_init_time<K: Kernel>(
     ctx: &mut impl AsContextMut<Data = InvocationData<K>>,
     timer: GasTimer,
 ) {
@@ -231,106 +252,151 @@ fn min_table_elements(module: &Module) -> Option<u32> {
     }
 }
 
-use self::bind::BindSyscall;
-use self::error::Abort;
+impl<K> SyscallHandler<K> for DefaultKernel<K::CallManager>
+where
+    K: Kernel
+        + ActorOps
+        + IpldBlockOps
+        + SendOps
+        + UpgradeOps
+        + CryptoOps
+        + DebugOps
+        + EventOps
+        + MessageOps
+        + NetworkOps
+        + RandomnessOps
+        + SelfOps,
+{
+    fn link_syscalls(linker: &mut Linker<K>) -> anyhow::Result<()> {
+        linker.link_syscall("vm", "exit", vm::exit)?;
+        linker.link_syscall("vm", "message_context", vm::message_context)?;
 
-// Binds the syscall handlers so they can handle invocations
-// from the actor code.
-pub fn bind_syscalls(
-    linker: &mut Linker<InvocationData<impl Kernel + 'static>>,
-) -> anyhow::Result<()> {
-    linker.bind("vm", "exit", vm::exit)?;
-    linker.bind("vm", "message_context", vm::message_context)?;
+        linker.link_syscall("network", "context", network::context)?;
+        linker.link_syscall("network", "tipset_cid", network::tipset_cid)?;
 
-    linker.bind(
-        "network",
-        "total_fil_circ_supply",
-        network::total_fil_circ_supply,
-    )?;
-    linker.bind("network", "context", network::context)?;
-    linker.bind("network", "tipset_cid", network::tipset_cid)?;
+        linker.link_syscall("ipld", "block_open", ipld::block_open)?;
+        linker.link_syscall("ipld", "block_create", ipld::block_create)?;
+        linker.link_syscall("ipld", "block_read", ipld::block_read)?;
+        linker.link_syscall("ipld", "block_stat", ipld::block_stat)?;
+        linker.link_syscall("ipld", "block_link", ipld::block_link)?;
 
-    linker.bind("ipld", "block_open", ipld::block_open)?;
-    linker.bind("ipld", "block_create", ipld::block_create)?;
-    linker.bind("ipld", "block_read", ipld::block_read)?;
-    linker.bind("ipld", "block_stat", ipld::block_stat)?;
-    linker.bind("ipld", "block_link", ipld::block_link)?;
+        linker.link_syscall("self", "root", sself::root)?;
+        linker.link_syscall("self", "set_root", sself::set_root)?;
+        linker.link_syscall("self", "current_balance", sself::current_balance)?;
+        linker.link_syscall("self", "self_destruct", sself::self_destruct)?;
 
-    linker.bind("self", "root", sself::root)?;
-    linker.bind("self", "set_root", sself::set_root)?;
-    linker.bind("self", "current_balance", sself::current_balance)?;
-    linker.bind("self", "self_destruct", sself::self_destruct)?;
+        linker.link_syscall("actor", "resolve_address", actor::resolve_address)?;
+        linker.link_syscall(
+            "actor",
+            "lookup_delegated_address",
+            actor::lookup_delegated_address,
+        )?;
+        linker.link_syscall("actor", "get_actor_code_cid", actor::get_actor_code_cid)?;
+        linker.link_syscall("actor", "next_actor_address", actor::next_actor_address)?;
+        linker.link_syscall("actor", "create_actor", actor::create_actor)?;
+        if cfg!(feature = "upgrade-actor") {
+            // We disable/enable with the feature, but we always compile this code to ensure we don't
+            // accidentally break it.
+            linker.link_syscall("actor", "upgrade_actor", actor::upgrade_actor)?;
+        }
+        linker.link_syscall(
+            "actor",
+            "get_builtin_actor_type",
+            actor::get_builtin_actor_type,
+        )?;
+        linker.link_syscall(
+            "actor",
+            "get_code_cid_for_type",
+            actor::get_code_cid_for_type,
+        )?;
+        linker.link_syscall("actor", "balance_of", actor::balance_of)?;
 
-    linker.bind("actor", "resolve_address", actor::resolve_address)?;
-    linker.bind(
-        "actor",
-        "lookup_delegated_address",
-        actor::lookup_delegated_address,
-    )?;
-    linker.bind("actor", "get_actor_code_cid", actor::get_actor_code_cid)?;
-    linker.bind("actor", "next_actor_address", actor::next_actor_address)?;
-    linker.bind("actor", "create_actor", actor::create_actor)?;
-    linker.bind(
-        "actor",
-        "get_builtin_actor_type",
-        actor::get_builtin_actor_type,
-    )?;
-    linker.bind(
-        "actor",
-        "get_code_cid_for_type",
-        actor::get_code_cid_for_type,
-    )?;
-    linker.bind("actor", "balance_of", actor::balance_of)?;
+        // Only wire this syscall when M2 native is enabled.
+        if cfg!(feature = "m2-native") {
+            linker.link_syscall("actor", "install_actor", actor::install_actor)?;
+        }
+        #[cfg(feature = "verify-signature")]
+        linker.link_syscall("crypto", "verify_signature", crypto::verify_signature)?;
+        linker.link_syscall(
+            "crypto",
+            "verify_bls_aggregate",
+            crypto::verify_bls_aggregate,
+        )?;
+        linker.link_syscall(
+            "crypto",
+            "recover_secp_public_key",
+            crypto::recover_secp_public_key,
+        )?;
+        linker.link_syscall("crypto", "hash", crypto::hash)?;
 
-    // Only wire this syscall when M2 native is enabled.
-    #[cfg(feature = "m2-native")]
-    linker.bind("actor", "install_actor", actor::install_actor)?;
+        linker.link_syscall("event", "emit_event", event::emit_event)?;
 
-    linker.bind("crypto", "verify_signature", crypto::verify_signature)?;
-    linker.bind(
-        "crypto",
-        "recover_secp_public_key",
-        crypto::recover_secp_public_key,
-    )?;
-    linker.bind("crypto", "hash", crypto::hash)?;
-    linker.bind("crypto", "verify_seal", crypto::verify_seal)?;
-    linker.bind("crypto", "verify_post", crypto::verify_post)?;
-    linker.bind(
-        "crypto",
-        "compute_unsealed_sector_cid",
-        crypto::compute_unsealed_sector_cid,
-    )?;
-    linker.bind(
-        "crypto",
-        "verify_consensus_fault",
-        crypto::verify_consensus_fault,
-    )?;
-    linker.bind(
-        "crypto",
-        "verify_aggregate_seals",
-        crypto::verify_aggregate_seals,
-    )?;
-    linker.bind(
-        "crypto",
-        "verify_replica_update",
-        crypto::verify_replica_update,
-    )?;
-    linker.bind("crypto", "batch_verify_seals", crypto::batch_verify_seals)?;
+        linker.link_syscall("rand", "get_chain_randomness", rand::get_chain_randomness)?;
+        linker.link_syscall("rand", "get_beacon_randomness", rand::get_beacon_randomness)?;
 
-    linker.bind("event", "emit_event", event::emit_event)?;
+        linker.link_syscall("gas", "charge", gas::charge_gas)?;
+        linker.link_syscall("gas", "available", gas::available)?;
 
-    linker.bind("rand", "get_chain_randomness", rand::get_chain_randomness)?;
-    linker.bind("rand", "get_beacon_randomness", rand::get_beacon_randomness)?;
+        // Ok, this singled-out syscall should probably be in another category.
+        linker.link_syscall("send", "send", send::send)?;
 
-    linker.bind("gas", "charge", gas::charge_gas)?;
-    linker.bind("gas", "available", gas::available)?;
+        linker.link_syscall("debug", "log", debug::log)?;
+        linker.link_syscall("debug", "enabled", debug::enabled)?;
+        linker.link_syscall("debug", "store_artifact", debug::store_artifact)?;
 
-    // Ok, this singled-out syscall should probably be in another category.
-    linker.bind("send", "send", send::send)?;
+        Ok(())
+    }
+}
 
-    linker.bind("debug", "log", debug::log)?;
-    linker.bind("debug", "enabled", debug::enabled)?;
-    linker.bind("debug", "store_artifact", debug::store_artifact)?;
+impl<K> SyscallHandler<K> for DefaultFilecoinKernel<K::CallManager>
+where
+    K: FilecoinKernel
+        + ActorOps
+        + SendOps
+        + UpgradeOps
+        + IpldBlockOps
+        + CryptoOps
+        + DebugOps
+        + EventOps
+        + MessageOps
+        + NetworkOps
+        + RandomnessOps
+        + SelfOps,
+{
+    fn link_syscalls(linker: &mut Linker<K>) -> anyhow::Result<()> {
+        DefaultKernel::<K::CallManager>::link_syscalls(linker)?;
 
-    Ok(())
+        // Bind the circulating supply call.
+        linker.link_syscall(
+            "network",
+            "total_fil_circ_supply",
+            filecoin::total_fil_circ_supply,
+        )?;
+
+        // Now bind the crypto syscalls.
+        linker.link_syscall(
+            "crypto",
+            "compute_unsealed_sector_cid",
+            filecoin::compute_unsealed_sector_cid,
+        )?;
+        linker.link_syscall("crypto", "verify_post", filecoin::verify_post)?;
+        linker.link_syscall(
+            "crypto",
+            "verify_consensus_fault",
+            filecoin::verify_consensus_fault,
+        )?;
+        linker.link_syscall(
+            "crypto",
+            "verify_aggregate_seals",
+            filecoin::verify_aggregate_seals,
+        )?;
+        linker.link_syscall(
+            "crypto",
+            "verify_replica_update",
+            filecoin::verify_replica_update,
+        )?;
+        linker.link_syscall("crypto", "batch_verify_seals", filecoin::batch_verify_seals)?;
+
+        Ok(())
+    }
 }

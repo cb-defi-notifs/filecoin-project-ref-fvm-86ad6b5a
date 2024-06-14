@@ -1,5 +1,32 @@
 # Changelog
 
+Changes to the reference FVM's HAMT implementation.
+
+## [Unreleased]
+
+## 0.9.0 (2023-10-25)
+
+Breaking Changes:
+
+- Remove the `ignore-dead-links` feature.
+- Add a new `StartKeyNotFound` variant to the HAMT error type.
+
+Features:
+
+- Implement external iteration via `iter()` and `iter_from(start_key)`.
+
+Fixes:
+
+- Extra-paranoid validation when reading HAMT nodes.
+
+## 0.8.0 [2023-08-18)
+
+Breaking Changes:
+
+- Deprecate default bitwidths in the HAMT
+  - Users must now always specify the bitwidth
+- Add support for the Hamt version 0 datastructure, for historical purposes.
+
 ## 0.7.0 [2023-06-28)
 
 Breaking Changes:

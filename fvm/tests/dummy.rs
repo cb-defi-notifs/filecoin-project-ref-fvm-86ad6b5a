@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use anyhow::Context;
 use cid::Cid;
-use fvm::call_manager::{Backtrace, CallManager, FinishRet, InvocationResult};
+use fvm::call_manager::{Backtrace, CallManager, Entrypoint, FinishRet, InvocationResult};
 use fvm::engine::Engine;
 use fvm::externs::{Chain, Consensus, Externs, Rand};
 use fvm::gas::{Gas, GasCharge, GasTimer, GasTracker};
@@ -25,7 +25,7 @@ use fvm_shared::version::NetworkVersion;
 use fvm_shared::{ActorID, IDENTITY_HASH};
 use multihash::{Code, Multihash};
 
-pub const STUB_NETWORK_VER: NetworkVersion = NetworkVersion::V18;
+pub const STUB_NETWORK_VER: NetworkVersion = NetworkVersion::V21;
 
 /// Unimplemented and empty `Externs` impl
 pub struct DummyExterns;
@@ -35,18 +35,14 @@ impl Externs for DummyExterns {}
 impl Rand for DummyExterns {
     fn get_chain_randomness(
         &self,
-        _pers: i64,
         _round: fvm_shared::clock::ChainEpoch,
-        _entropy: &[u8],
     ) -> anyhow::Result<[u8; 32]> {
         todo!()
     }
 
     fn get_beacon_randomness(
         &self,
-        _pers: i64,
         _round: fvm_shared::clock::ChainEpoch,
-        _entropy: &[u8],
     ) -> anyhow::Result<[u8; 32]> {
         todo!()
     }
@@ -278,11 +274,11 @@ impl CallManager for DummyCallManager {
         }
     }
 
-    fn send<K: Kernel<CallManager = Self>>(
+    fn call_actor<K: Kernel<CallManager = Self>>(
         &mut self,
         _from: fvm_shared::ActorID,
         _to: Address,
-        _method: fvm_shared::MethodNum,
+        _entrypoint: Entrypoint,
         _params: Option<kernel::Block>,
         _value: &fvm_shared::econ::TokenAmount,
         _gas_limit: Option<Gas>,
@@ -359,6 +355,10 @@ impl CallManager for DummyCallManager {
         _actor_id: ActorID,
         _delegated_address: Option<Address>,
     ) -> kernel::Result<()> {
+        todo!()
+    }
+
+    fn get_call_stack(&self) -> &[(ActorID, &'static str)] {
         todo!()
     }
 

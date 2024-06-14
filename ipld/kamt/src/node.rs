@@ -7,11 +7,11 @@ use std::fmt::Debug;
 
 use cid::Cid;
 use fvm_ipld_blockstore::Blockstore;
-use fvm_ipld_encoding::CborStore;
+use fvm_ipld_encoding::{CborStore, DAG_CBOR};
 use multihash::Code;
 use once_cell::unsync::OnceCell;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Serialize, Serializer};
 
 use super::bitfield::Bitfield;
 use super::hash_bits::HashBits;
@@ -46,16 +46,100 @@ where
     }
 }
 
-impl<'de, K, V, H, const N: usize> Deserialize<'de> for Node<K, V, H, N>
+impl<K, V, H, const N: usize> Node<K, V, H, N>
 where
-    K: DeserializeOwned,
+    K: PartialOrd + DeserializeOwned,
     V: DeserializeOwned,
 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let (bitfield, pointers) = Deserialize::deserialize(deserializer)?;
+    pub fn load(
+        conf: &Config,
+        store: &impl Blockstore,
+        k: &Cid,
+        depth: u32,
+    ) -> Result<Self, Error> {
+        let (bitfield, pointers): (Bitfield, Vec<Pointer<K, V, H, N>>) = store
+            .get_cbor(k)?
+            .ok_or_else(|| Error::CidNotFound(k.to_string()))?;
+
+        if pointers.len() > 1 << conf.bit_width {
+            return Err(Error::Dynamic(anyhow::anyhow!(
+                "number of pointers ({}) exceeds that allowed by the bitwidth ({})",
+                pointers.len(),
+                1 << conf.bit_width,
+            )));
+        }
+
+        if bitfield.count_ones() != pointers.len() {
+            return Err(Error::Dynamic(anyhow::anyhow!(
+                "number of pointers ({}) doesn't match bitfield ({})",
+                pointers.len(),
+                bitfield.count_ones(),
+            )));
+        }
+
+        // We only allow empty pointers at the root.
+        if pointers.is_empty() && depth != 0 {
+            return Err(Error::ZeroPointers);
+        }
+
+        for ptr in &pointers {
+            match ptr {
+                Pointer::Values(kvs) => {
+                    if depth < conf.min_data_depth {
+                        return Err(Error::Dynamic(anyhow::anyhow!(
+                            "values not allowed below the minimum data depth ({} < {})",
+                            depth,
+                            conf.min_data_depth,
+                        )));
+                    }
+                    if kvs.is_empty() {
+                        return Err(Error::Dynamic(anyhow::anyhow!("empty HAMT bucket")));
+                    }
+                    if kvs.len() > conf.max_array_width {
+                        return Err(Error::Dynamic(anyhow::anyhow!(
+                            "too many items in bucket {} > {}",
+                            kvs.len(),
+                            conf.max_array_width,
+                        )));
+                    }
+                    if !kvs.windows(2).all(|window| {
+                        let [a, b] = window else {
+                            panic!("invalid window length")
+                        };
+                        a.key() < b.key()
+                    }) {
+                        return Err(Error::Dynamic(anyhow::anyhow!(
+                            "duplicate or unsorted keys in bucket"
+                        )));
+                    }
+                }
+                Pointer::Link { cid, ext, .. } => {
+                    if cid.codec() != DAG_CBOR {
+                        return Err(Error::Dynamic(anyhow::anyhow!(
+                            "kamt nodes must be DagCBOR, not {}",
+                            cid.codec()
+                        )));
+                    }
+                    if ext.len() % conf.bit_width != 0 {
+                        return Err(Error::Dynamic(anyhow::anyhow!(
+                            "extension length {} is not a multiple of the bit-width {}",
+                            ext.len(),
+                            conf.bit_width,
+                        )));
+                    }
+                    let remaining_bits = (N as u32 * u8::BITS) - (depth + 1) * conf.bit_width;
+                    if remaining_bits <= ext.len() {
+                        return Err(Error::Dynamic(anyhow::anyhow!(
+                            "extension length must be less than {} bits, was {} bits",
+                            remaining_bits,
+                            ext.len(),
+                        )));
+                    }
+                }
+                Pointer::Dirty { .. } => panic!("fresh node can't be dirty"),
+            }
+        }
+
         Ok(Node { bitfield, pointers })
     }
 }
@@ -168,43 +252,6 @@ where
         )
     }
 
-    pub(crate) fn for_each<S, F>(&self, store: &S, f: &mut F) -> Result<(), Error>
-    where
-        F: FnMut(&K, &V) -> anyhow::Result<()>,
-        S: Blockstore,
-    {
-        for p in &self.pointers {
-            match p {
-                Pointer::Link { cid, cache, .. } => {
-                    if let Some(cached_node) = cache.get() {
-                        cached_node.for_each(store, f)?
-                    } else {
-                        let node = if let Some(node) = store.get_cbor(cid)? {
-                            node
-                        } else {
-                            #[cfg(not(feature = "ignore-dead-links"))]
-                            return Err(Error::CidNotFound(cid.to_string()));
-
-                            #[cfg(feature = "ignore-dead-links")]
-                            continue;
-                        };
-
-                        // Ignore error intentionally, the cache value will always be the same
-                        let cache_node = cache.get_or_init(|| node);
-                        cache_node.for_each(store, f)?
-                    }
-                }
-                Pointer::Dirty { node, .. } => node.for_each(store, f)?,
-                Pointer::Values(kvs) => {
-                    for kv in kvs {
-                        f(kv.0.borrow(), kv.1.borrow())?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Search for a key.
     fn search<Q, S: Blockstore>(
         &self,
@@ -220,6 +267,7 @@ where
         self.get_value(
             &mut HashBits::new(H::as_hashed_key(key).as_ref()),
             conf,
+            0,
             key,
             store,
         )
@@ -229,6 +277,7 @@ where
         &self,
         hashed_key: &mut HashBits,
         conf: &Config,
+        depth: u32,
         key: &Q,
         store: &S,
     ) -> Result<Option<&V>, Error>
@@ -247,23 +296,8 @@ where
 
         let (node, ext) = match child {
             Pointer::Link { cid, cache, ext } => {
-                let node = if let Some(cached_node) = cache.get() {
-                    // Link node is cached
-                    cached_node
-                } else {
-                    let node: Box<Node<K, V, H, N>> = if let Some(node) = store.get_cbor(cid)? {
-                        node
-                    } else {
-                        #[cfg(not(feature = "ignore-dead-links"))]
-                        return Err(Error::CidNotFound(cid.to_string()));
-
-                        #[cfg(feature = "ignore-dead-links")]
-                        return Ok(None);
-                    };
-                    // Intentionally ignoring error, cache will always be the same.
-                    cache.get_or_init(|| node)
-                };
-
+                let node = cache
+                    .get_or_try_init(|| Node::load(conf, store, cid, depth + 1).map(Box::new))?;
                 (node, ext)
             }
             Pointer::Dirty { node, ext } => (node, ext),
@@ -276,7 +310,7 @@ where
         };
 
         match match_extension(conf, hashed_key, ext)? {
-            ExtensionMatch::Full { .. } => node.get_value(hashed_key, conf, key, store),
+            ExtensionMatch::Full { .. } => node.get_value(hashed_key, conf, depth + 1, key, store),
             ExtensionMatch::Partial { .. } => Ok(None),
         }
     }
@@ -322,9 +356,7 @@ where
             Pointer::Link { cid, cache, ext } => match match_extension(conf, hashed_key, ext)? {
                 ExtensionMatch::Full { skipped } => {
                     cache.get_or_try_init(|| {
-                        store
-                            .get_cbor(cid)?
-                            .ok_or_else(|| Error::CidNotFound(cid.to_string()))
+                        Node::load(conf, store, cid, depth + 1).map(Box::new)
                     })?;
                     let child_node = cache.get_mut().expect("filled line above");
 
@@ -487,9 +519,7 @@ where
             Pointer::Link { cid, cache, ext } => match match_extension(conf, hashed_key, ext)? {
                 ExtensionMatch::Full { skipped } => {
                     cache.get_or_try_init(|| {
-                        store
-                            .get_cbor(cid)?
-                            .ok_or_else(|| Error::CidNotFound(cid.to_string()))
+                        Node::load(conf, store, cid, depth + 1).map(Box::new)
                     })?;
                     let child_node = cache.get_mut().expect("filled line above");
 
@@ -577,12 +607,6 @@ where
         self.pointers.insert(i, Pointer::Dirty { node, ext })
     }
 
-    fn index_for_bit_pos(&self, bp: u32) -> usize {
-        let mask = Bitfield::zero().set_bits_le(bp);
-        assert_eq!(mask.count_ones(), bp as usize);
-        mask.and(&self.bitfield).count_ones()
-    }
-
     fn get_child_mut(&mut self, i: usize) -> &mut Pointer<K, V, H, N> {
         &mut self.pointers[i]
     }
@@ -651,7 +675,7 @@ where
 /// Helper method to check if a key matches an extension (if there is one)
 /// and return the number of levels skipped. If the key doesn't match,
 /// this will be the number of levels where the extension has to be split.
-fn match_extension<'a>(
+pub(crate) fn match_extension<'a>(
     conf: &Config,
     hashed_key: &mut HashBits,
     ext: &'a Extension,
@@ -671,14 +695,14 @@ fn match_extension<'a>(
 }
 
 /// Result of matching a `HashedKey` to an `Extension`.
-enum ExtensionMatch<'a> {
+pub(crate) enum ExtensionMatch<'a> {
     /// The hash fully matched the extension, which is also the case if there was no extension at all.
     Full { skipped: u32 },
     /// The hash matched some (potentially empty) prefix of the extension.
     Partial(PartialMatch<'a>),
 }
 
-struct PartialMatch<'a> {
+pub(crate) struct PartialMatch<'a> {
     /// The original extension.
     ext: &'a Extension,
     /// Number of bits matched.
@@ -694,5 +718,13 @@ impl<'a> PartialMatch<'a> {
         let idx = idx.path_bits().next(bit_width)?;
 
         Ok((head, idx, tail))
+    }
+}
+
+impl<K, V, H, const N: usize> Node<K, V, H, N> {
+    pub(crate) fn index_for_bit_pos(&self, bp: u32) -> usize {
+        let mask = Bitfield::zero().set_bits_le(bp);
+        assert_eq!(mask.count_ones(), bp as usize);
+        mask.and(&self.bitfield).count_ones()
     }
 }

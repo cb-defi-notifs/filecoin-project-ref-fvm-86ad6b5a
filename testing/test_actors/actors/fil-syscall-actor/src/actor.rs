@@ -1,6 +1,7 @@
 // Copyright 2021-2023 Protocol Labs
 // SPDX-License-Identifier: Apache-2.0, MIT
 use fvm_sdk as sdk;
+use fvm_sdk::sys::network::{context, NetworkContext};
 use fvm_shared::address::Address;
 use fvm_shared::chainid::ChainID;
 use fvm_shared::crypto::hash::SupportedHashes as SharedSupportedHashes;
@@ -9,6 +10,7 @@ use fvm_shared::error::ErrorNumber;
 use fvm_shared::sector::RegisteredSealProof;
 use multihash::derive::Multihash;
 use multihash::{Blake2b256, Blake2b512, Keccak256, Ripemd160, Sha2_256};
+use std::ptr;
 
 #[derive(Clone, Copy, Debug, Eq, Multihash, PartialEq)]
 #[mh(alloc_size = 64)]
@@ -30,20 +32,23 @@ pub enum SupportedHashes {
 pub fn invoke(_: u32) -> u32 {
     sdk::initialize();
 
-    test_signature();
+    test_secp_signature();
+    test_bls_signature();
+    test_bls_aggregate();
     test_expected_hash();
     test_hash_syscall();
     test_compute_unsealed_sector_cid();
     test_network_context();
     test_message_context();
     test_balance();
+    test_unaligned();
 
     #[cfg(coverage)]
     sdk::debug::store_artifact("syscall_actor.profraw", minicov::capture_coverage());
     0
 }
 
-fn test_signature() {
+fn test_secp_signature() {
     // the following vectors represent a valid secp256k1 signatures for an address and plaintext message
     //
     let signature_bytes: Vec<u8> = vec![
@@ -93,6 +98,7 @@ fn test_signature() {
     // test that calling sdk::sys::crypto::verify_signature with invalid parameters result
     // in correct error value
     //
+    #[cfg(feature = "verify-signature")]
     unsafe {
         let sig_type = signature.signature_type();
         let sig_bytes = signature.bytes();
@@ -136,6 +142,123 @@ fn test_signature() {
         let res = sdk::sys::crypto::recover_secp_public_key(hash.as_ptr(), (u32::MAX) as *const u8);
         assert_eq!(res, Err(ErrorNumber::IllegalArgument));
     }
+}
+
+fn test_bls_signature() {
+    let msg = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+    let pub_key = [
+        173, 154, 145, 188, 114, 85, 101, 250, 129, 225, 3, 205, 128, 61, 161, 185, 210, 18, 147,
+        84, 160, 15, 233, 114, 178, 113, 115, 142, 4, 221, 81, 215, 188, 151, 11, 87, 4, 110, 23,
+        219, 125, 143, 122, 176, 207, 123, 66, 146,
+    ];
+
+    let addr = Address::new_bls(&pub_key).unwrap();
+
+    let sig = Signature::new_bls(vec![
+        177, 209, 192, 174, 213, 199, 231, 9, 247, 201, 250, 193, 14, 250, 138, 252, 155, 27, 66,
+        78, 14, 204, 165, 99, 192, 154, 96, 138, 179, 60, 59, 191, 58, 178, 229, 224, 43, 253, 43,
+        254, 200, 37, 117, 247, 203, 45, 111, 195, 5, 188, 14, 121, 40, 59, 41, 48, 157, 88, 89,
+        198, 177, 83, 24, 210, 254, 185, 78, 159, 230, 105, 29, 37, 169, 109, 247, 67, 111, 193,
+        17, 31, 51, 17, 241, 96, 224, 254, 111, 101, 129, 18, 16, 242, 177, 61, 143, 64,
+    ]);
+
+    // Test successful signature validation.
+    let res = sdk::crypto::verify_signature(&sig, &addr, &msg);
+    assert_eq!(res, Ok(true));
+
+    // Test invalid signature. The following signature bytes represent a valid G2 point.
+    let invalid_sig = Signature::new_bls(vec![
+        146, 72, 239, 152, 88, 59, 69, 25, 119, 24, 54, 37, 105, 220, 134, 131, 46, 186, 98, 35,
+        46, 160, 88, 225, 195, 50, 135, 39, 24, 178, 11, 241, 46, 166, 214, 198, 67, 200, 61, 183,
+        51, 108, 69, 115, 184, 150, 124, 32, 21, 192, 204, 174, 253, 151, 49, 111, 246, 60, 52,
+        147, 90, 133, 90, 53, 9, 9, 78, 187, 127, 26, 207, 47, 240, 248, 109, 45, 104, 83, 99, 45,
+        35, 78, 18, 219, 13, 50, 145, 26, 23, 6, 103, 32, 248, 188, 235, 111,
+    ]);
+    let res = sdk::crypto::verify_signature(&invalid_sig, &addr, &msg);
+    assert_eq!(res, Ok(false));
+
+    // Test invalid public key. The following public key bytes represent a valid G1 point.
+    let invalid_pub_key = [
+        146, 70, 145, 58, 25, 235, 94, 212, 41, 157, 27, 198, 144, 178, 157, 191, 218, 85, 23, 81,
+        198, 2, 84, 171, 8, 212, 251, 62, 143, 46, 241, 61, 248, 22, 169, 138, 16, 19, 39, 179,
+        114, 132, 67, 130, 45, 96, 1, 132,
+    ];
+    let invalid_addr = Address::new_bls(&invalid_pub_key).unwrap();
+    let res = sdk::crypto::verify_signature(&sig, &invalid_addr, &msg);
+    assert_eq!(res, Ok(false));
+
+    // Test invalid message.
+    let mut invalid_msg = msg;
+    invalid_msg[0] += 1;
+    let res = sdk::crypto::verify_signature(&sig, &addr, &invalid_msg);
+    assert_eq!(res, Ok(false));
+}
+
+fn test_bls_aggregate() {
+    let mut msgs_bytes = 0..;
+    let msg_1: Vec<u8> = (&mut msgs_bytes).take(10).collect();
+    let msg_2: Vec<u8> = (&mut msgs_bytes).take(10).collect();
+    let msg_3: Vec<u8> = (&mut msgs_bytes).take(10).collect();
+    let msgs = [msg_1.as_slice(), msg_2.as_slice(), msg_3.as_slice()];
+
+    let pub_keys = [
+        [
+            173, 154, 145, 188, 114, 85, 101, 250, 129, 225, 3, 205, 128, 61, 161, 185, 210, 18,
+            147, 84, 160, 15, 233, 114, 178, 113, 115, 142, 4, 221, 81, 215, 188, 151, 11, 87, 4,
+            110, 23, 219, 125, 143, 122, 176, 207, 123, 66, 146,
+        ],
+        [
+            166, 188, 253, 186, 140, 16, 193, 46, 218, 161, 3, 28, 70, 112, 192, 253, 195, 179,
+            167, 181, 197, 130, 19, 216, 51, 188, 86, 179, 88, 40, 161, 215, 116, 189, 157, 29, 27,
+            61, 144, 111, 195, 221, 100, 87, 107, 239, 25, 189,
+        ],
+        [
+            167, 241, 45, 72, 153, 172, 192, 10, 118, 144, 223, 120, 38, 106, 140, 48, 14, 57, 104,
+            0, 67, 174, 148, 177, 204, 138, 35, 201, 92, 108, 208, 60, 109, 226, 9, 169, 2, 168,
+            27, 73, 138, 221, 77, 74, 103, 186, 117, 225,
+        ],
+    ];
+
+    let sig = [
+        164, 39, 224, 212, 184, 193, 176, 129, 10, 127, 96, 36, 101, 63, 133, 5, 223, 148, 253, 34,
+        139, 109, 244, 229, 242, 247, 83, 84, 6, 96, 9, 163, 87, 252, 234, 52, 105, 48, 87, 38,
+        154, 48, 150, 34, 165, 53, 42, 108, 7, 106, 225, 93, 147, 11, 156, 109, 108, 226, 27, 126,
+        213, 199, 148, 3, 77, 102, 248, 239, 41, 108, 177, 159, 14, 50, 153, 49, 47, 22, 250, 113,
+        252, 170, 223, 150, 51, 97, 180, 19, 226, 171, 246, 197, 50, 92, 47, 182,
+    ];
+
+    // Assert that bls validation syscall succeeds.
+    let res = sdk::crypto::verify_bls_aggregate(&sig, &pub_keys, &msgs);
+    assert_eq!(res, Ok(true));
+
+    // Assert that bls validation syscall fails for an invalid aggregate signature. The following
+    // signature bytes represent as valid G2 point.
+    let invalid_sig = [
+        146, 72, 239, 152, 88, 59, 69, 25, 119, 24, 54, 37, 105, 220, 134, 131, 46, 186, 98, 35,
+        46, 160, 88, 225, 195, 50, 135, 39, 24, 178, 11, 241, 46, 166, 214, 198, 67, 200, 61, 183,
+        51, 108, 69, 115, 184, 150, 124, 32, 21, 192, 204, 174, 253, 151, 49, 111, 246, 60, 52,
+        147, 90, 133, 90, 53, 9, 9, 78, 187, 127, 26, 207, 47, 240, 248, 109, 45, 104, 83, 99, 45,
+        35, 78, 18, 219, 13, 50, 145, 26, 23, 6, 103, 32, 248, 188, 235, 111,
+    ];
+    let res = sdk::crypto::verify_bls_aggregate(&invalid_sig, &pub_keys, &msgs);
+    assert_eq!(res, Ok(false));
+
+    // Assert that bls validation syscall fails for an invalid public key. The following public key
+    // bytes represent as valid G1 point.
+    let invalid_pub_key = [
+        146, 70, 145, 58, 25, 235, 94, 212, 41, 157, 27, 198, 144, 178, 157, 191, 218, 85, 23, 81,
+        198, 2, 84, 171, 8, 212, 251, 62, 143, 46, 241, 61, 248, 22, 169, 138, 16, 19, 39, 179,
+        114, 132, 67, 130, 45, 96, 1, 132,
+    ];
+    let invalid_pub_keys = [invalid_pub_key, pub_keys[1], pub_keys[2]];
+    let res = sdk::crypto::verify_bls_aggregate(&sig, &invalid_pub_keys, &msgs);
+    assert_eq!(res, Ok(false));
+
+    // Assert that bls validation syscall fails for invalid messages.
+    let invalid_msgs = [&[11, 22, 33, 44], msgs[1], msgs[2]];
+    let res = sdk::crypto::verify_bls_aggregate(&sig, &pub_keys, &invalid_msgs);
+    assert_eq!(res, Ok(false));
 }
 
 // use SDK methods to hash and compares against locally (inside the actor) hashed digest
@@ -325,7 +448,7 @@ fn test_network_context() {
     use fvm_shared::version::NetworkVersion;
     assert_eq!(sdk::network::chain_id(), ChainID::from(1)); // hehe we are ETH now
     assert_eq!(sdk::network::curr_epoch(), 0);
-    assert_eq!(sdk::network::version(), NetworkVersion::V18);
+    assert_eq!(sdk::network::version(), NetworkVersion::V21);
     assert_eq!(sdk::network::tipset_timestamp(), 0);
     assert_eq!(sdk::network::base_fee(), TokenAmount::from_atto(100));
 }
@@ -349,4 +472,28 @@ fn test_balance() {
         sdk::actor::balance_of(sdk::message::receiver()),
         Some(sdk::sself::current_balance())
     );
+}
+
+/// Test to make sure we can return into unaligned pointers. Technically, we use repr-packed
+/// everywhere so this should always work, but we should test anyways.
+fn test_unaligned() {
+    unsafe {
+        #[link(wasm_import_module = "network")]
+        extern "C" {
+            #[link_name = "context"]
+            fn context_raw(out: *mut NetworkContext) -> u32;
+        }
+
+        #[repr(packed, C)]
+        struct Unaligned {
+            _padding: u8,
+            ctx: NetworkContext,
+        }
+        let mut unaligned: Unaligned = std::mem::zeroed();
+        assert_eq!(context_raw(ptr::addr_of_mut!(unaligned.ctx)), 0);
+        let out_ptr = ptr::addr_of!(unaligned.ctx);
+        let actual: NetworkContext = ptr::read_unaligned(out_ptr);
+        let expected = context().unwrap();
+        assert_eq!(expected, actual);
+    }
 }

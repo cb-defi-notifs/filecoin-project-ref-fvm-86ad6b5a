@@ -1,6 +1,99 @@
 // Copyright 2021-2023 Protocol Labs
-// Copyright 2019-2022 ChainSafe Systems
+// Copyright 2019-2023 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
+//! In the context of this code, an Array Mapped Trie (AMT) is a data structure
+//! utilizing an IPLD blockstore that solves the problem of referencing shared
+//! data without copying an entire array. This implementation is similar to an
+//! [IPLD vector](https://github.com/ipld/specs/blob/master/data-structures/vector.md)
+//! but supports internal node compression and therefore sparse arrays. This is
+//! the Rust implementation of the Go implementation documented [here](https://pkg.go.dev/github.com/filecoin-project/go-amt-ipld/v4#section-readme):
+//! "The AMT algorithm produces a tree-like graph, with a single root node addressing
+//! a collection of child nodes which connect downward toward leaf nodes which store
+//! the actual entries. No terminal entries are stored in intermediate elements
+//! of the tree... We can divide up the AMT tree structure into "levels" or "heights",
+//! where a height of zero contains the terminal elements, and the maximum height
+//! of the tree contains the single root node. Intermediate nodes are used to span
+//! across the range of indexes."
+//!
+//!
+//! The maximum width for any node in the AMT structure is determined by
+//! `2 ^ bit_width`, meaning a node with the default branching factor of
+//! `3` has a maximum index range of `8` and can therefore be indexed from `0`
+//! to `(2 ^ 3) - 1 = 7`. The maximum index range for the overall structure is
+//! determined by both the branching factor and the height of the structure; the
+//! width of this range is `bit_width ^ (height + 1)`. The height is specified
+//! using a bottom-up numbering scheme, with the terminal leaves at a height of
+//! `0` and the root node at the maximum height. Nodes can be either a `Link` or
+//! a `Leaf` variant, which are actually a vector of links or a vector of values,
+//! respectively. Each entry in the `Link` variant's vector may contain a CID or
+//! a cache which holds a pointer to another `Node`; the pointer's value can only
+//! be written once. Clearing the value of the cache and updating the CID requires
+//! flushing, which is discussed in more detail below.
+//!
+//! An example with a single root node that is also a leaf node. This AMT has the
+//! default branching factor, a height of `0`, and contains a single element at
+//! index `2`.
+//! ```text
+//!                    ____________
+//!                   | root node  |  <--height 0
+//!                   |____________|
+//!                         |
+//!         | 0  | 1  | 2  | 3  | 4  | 5  | 6  | 7  |  <-- index
+//!         |None|None|Some|None|None|None|None|None|  <-- value
+//! ```
+//!
+//! A less trivial example is an AMT with a branching factor of `2` and a height
+//! of `1`. The children nodes are leaf nodes in this example, and the leaves contain
+//! values at indices `2`, `5`, `8`, and `15`.
+//! ```text
+//!                           ____________
+//!                          | root node  |  <-- height 1
+//!                          |____________|
+//!                                 |
+//!           __________________________________________________________________
+//!          |                     |                     |                      |
+//!    ____________           ____________          ____________           ____________
+//!   | child node |         | child node |        | child node |         | child node |  <-- height 0
+//!   |____________|         |____________|        |____________|         |____________|
+//! | 0  | 1  | 2  | 3  |  | 4  | 5  | 6  | 7  |  | 8  | 9  | 10 | 11 |  | 12 | 13 | 14 | 15 |  <-- index
+//! |None|None|Some|None|  |None|Some|None|None|  |Some|None|None|None|  |None|None|None|Some|  <-- value       
+//! ```
+//!
+//! Extending this example a bit further, let's say we create an empty AMT with
+//! a branching factor of two using `Amt::new_with_bit_width` and then
+//! push a value to index `16` using `.set`. This will cause the AMT to expand
+//! to a height of `2` with a structure as follows:
+//! ```text
+//!                           ____________
+//!                          | root node  |  <-- height 2
+//!                          |____________|
+//!                                 |
+//!           ___________________________________________________________________________________
+//!          |                     |                                      |                      |
+//!    ____________           ____________                          ____________           ____________
+//!   | child node |         | child node |                        | child node |         | child node |  <-- height 1
+//!   |____________|         |____________|                        |____________|         |____________|
+//!          |                      |                                     |                      |
+//!     ___________             _______________________              ___________            ___________
+//!    |   |   |   |           |               |   |   |            |   |   |   |          |   |   |   |
+//!    _   _   _   _      ____________         _   _   _            _   _   _   _          _   _   _   _
+//!   |_| |_| |_| |_|    | child node |       |_| |_| |_|          |_| |_| |_| |_|        |_| |_| |_| |_| <-- height 0
+//!  (indices 0 to 15)   |____________|       (indices 20 to 31)  (indices 32 to 47)      (indices 48 to 63)
+//!                     | 16 | 17 | 18 | 19 |
+//!                     |Some|None|None|None|
+//! ```
+//!
+//! In this example, the child node containing indices 16 to 19 is expanded to show
+//! detail; other than the value at index 16, all the other child nodes at height
+//! `0` are functionally identical.
+//!
+//! Each parent node contains a CID that represents a hash of the children nodes
+//! (CIDs) or leaves (values) under that node. When adding nodes and/or leaves,
+//! it would be inefficient to refresh all the parent node CIDs until necessary.
+//! As a result, modified nodes are identified using the `Dirty` variant of the
+//! `Link` enum; this way the cache can store the updated node information, and
+//! the CIDs are only regenerated when the AMT is flushed, which empties the data
+//! in the cache.
 
 use anyhow::anyhow;
 use cid::multihash::Code;
@@ -23,8 +116,8 @@ use crate::{
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct AmtImpl<V, BS, Ver> {
-    root: RootImpl<V, Ver>,
-    block_store: BS,
+    pub(crate) root: RootImpl<V, Ver>,
+    pub(crate) block_store: BS,
     /// Remember the last flushed CID until it changes.
     flushed_cid: Option<Cid>,
 }
@@ -78,7 +171,7 @@ where
         }
     }
 
-    fn bit_width(&self) -> u32 {
+    pub(super) fn bit_width(&self) -> u32 {
         self.root.bit_width
     }
 
@@ -355,40 +448,40 @@ where
     /// assert_eq!(&values, &[(1, "One".to_owned()), (4, "Four".to_owned())]);
     /// ```
     #[inline]
+    #[deprecated = "use `.iter()` instead"]
     pub fn for_each<F>(&self, mut f: F) -> Result<(), Error>
     where
         F: FnMut(u64, &V) -> anyhow::Result<()>,
     {
-        self.for_each_while(|i, x| {
-            f(i, x)?;
-            Ok(true)
-        })
+        for res in self {
+            let (k, v) = res?;
+            (f)(k, v)?;
+        }
+        Ok(())
     }
 
     /// Iterates over each value in the Amt and runs a function on the values, for as long as that
     /// function keeps returning `true`.
+    #[deprecated = "use `.iter()` instead"]
     pub fn for_each_while<F>(&self, mut f: F) -> Result<(), Error>
     where
         F: FnMut(u64, &V) -> anyhow::Result<bool>,
     {
-        self.root
-            .node
-            .for_each_while(
-                &self.block_store,
-                self.height(),
-                self.bit_width(),
-                0,
-                &mut f,
-            )
-            .map(|_| ())
+        for res in self.iter() {
+            let (i, v) = res?;
+            if !f(i, v)? {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Iterates over values in the Amt and runs a function on the values.
     ///
     /// The index in the amt is a `u64` and the value is the generic parameter `V` as defined
     /// in the Amt. If `start_at` is provided traversal begins at the first index >= `start_at`,
-    /// otherwise it begins from the first element. If `max` is provided, traversal will stop after
-    /// `max` elements have been traversed. Returns a tuple describing the number of elements
+    /// otherwise it begins from the first element. If `limit` is provided, traversal will stop after
+    /// `limit` elements have been traversed. Returns a tuple describing the number of elements
     /// iterated over and optionally the index of the next element in the AMT if more elements
     /// remain.
     ///
@@ -415,6 +508,7 @@ where
     /// assert_eq!(num_traversed, 3);
     /// assert_eq!(next_idx, Some(10));
     /// ```
+    #[deprecated = "use `.iter_from()` and `.take(limit)` instead"]
     pub fn for_each_ranged<F>(
         &self,
         start_at: Option<u64>,
@@ -424,19 +518,16 @@ where
     where
         F: FnMut(u64, &V) -> anyhow::Result<()>,
     {
-        let (_, num_traversed, next_index) = self.root.node.for_each_while_ranged(
-            &self.block_store,
-            start_at,
-            limit,
-            self.height(),
-            self.bit_width(),
-            0,
-            &mut |i, v| {
-                f(i, v)?;
-                Ok(true)
-            },
-        )?;
-        Ok((num_traversed, next_index))
+        let mut num_traversed = 0;
+        for kv in self.iter_from(start_at.unwrap_or(0))? {
+            let (k, v) = kv?;
+            if limit.map(|l| num_traversed >= l).unwrap_or(false) {
+                return Ok((num_traversed, Some(k)));
+            }
+            num_traversed += 1;
+            f(k, v)?;
+        }
+        Ok((num_traversed, None))
     }
 
     /// Iterates over values in the Amt and runs a function on the values, for as long as that
@@ -444,10 +535,11 @@ where
     ///
     /// The index in the amt is a `u64` and the value is the generic parameter `V` as defined
     /// in the Amt. If `start_at` is provided traversal begins at the first index >= `start_at`,
-    /// otherwise it begins from the first element. If `max` is provided, traversal will stop after
-    /// `max` elements have been traversed. Returns a tuple describing the number of elements
+    /// otherwise it begins from the first element. If `limit` is provided, traversal will stop after
+    /// `limit` elements have been traversed. Returns a tuple describing the number of elements
     /// iterated over and optionally the index of the next element in the AMT if more elements
     /// remain.
+    #[deprecated = "use `.iter_from()` and `.take(limit)` instead"]
     pub fn for_each_while_ranged<F>(
         &self,
         start_at: Option<u64>,
@@ -457,23 +549,23 @@ where
     where
         F: FnMut(u64, &V) -> anyhow::Result<bool>,
     {
-        let (_, num_traversed, next_index) = self.root.node.for_each_while_ranged(
-            &self.block_store,
-            start_at,
-            limit,
-            self.height(),
-            self.bit_width(),
-            0,
-            &mut f,
-        )?;
-        Ok((num_traversed, next_index))
+        let mut num_traversed = 0;
+        let mut keep_going = true;
+        for kv in self.iter_from(start_at.unwrap_or(0))? {
+            let (k, v) = kv?;
+            if !keep_going || limit.map(|l| num_traversed >= l).unwrap_or(false) {
+                return Ok((num_traversed, Some(k)));
+            }
+            num_traversed += 1;
+            keep_going = f(k, v)?;
+        }
+        Ok((num_traversed, None))
     }
 
     /// Iterates over each value in the Amt and runs a function on the values that allows modifying
     /// each value.
     pub fn for_each_mut<F>(&mut self, mut f: F) -> Result<(), Error>
     where
-        V: Clone,
         F: FnMut(u64, &mut ValueMut<'_, V>) -> anyhow::Result<()>,
     {
         self.for_each_while_mut(|i, x| {
@@ -486,63 +578,20 @@ where
     /// each value, for as long as that function keeps returning `true`.
     pub fn for_each_while_mut<F>(&mut self, mut f: F) -> Result<(), Error>
     where
-        // TODO remove clone bound when go-interop doesn't require it.
-        // (If needed without, this bound can be removed by duplicating function signatures)
-        V: Clone,
         F: FnMut(u64, &mut ValueMut<'_, V>) -> anyhow::Result<bool>,
     {
-        #[cfg(not(feature = "go-interop"))]
-        {
-            let (_, did_mutate) = self.root.node.for_each_while_mut(
-                &self.block_store,
-                self.height(),
-                self.bit_width(),
-                0,
-                &mut f,
-            )?;
+        let (_, did_mutate) = self.root.node.for_each_while_mut(
+            &self.block_store,
+            self.height(),
+            self.bit_width(),
+            0,
+            &mut f,
+        )?;
 
-            if did_mutate {
-                self.flushed_cid = None;
-            }
-
-            Ok(())
+        if did_mutate {
+            self.flushed_cid = None;
         }
 
-        // TODO remove requirement for this when/if changed in go-implementation
-        // This is not 100% compatible, because the blockstore reads/writes are not in the same
-        // order. If this is to be achieved, the for_each iteration would have to pause when
-        // a mutation occurs, set, then continue where it left off. This is a much more extensive
-        // change, and since it should not be feasibly triggered, it's left as this for now.
-        #[cfg(feature = "go-interop")]
-        {
-            let mut mutated = Vec::new();
-
-            self.root.node.for_each_while_mut(
-                &self.block_store,
-                self.height(),
-                self.bit_width(),
-                0,
-                &mut |idx, value| {
-                    let keep_going = f(idx, value)?;
-
-                    if value.value_changed() {
-                        // ! this is not ideal to clone and mark unchanged here, it is only done
-                        // because the go-implementation mutates the Amt as they iterate through it,
-                        // which we cannot do because it is memory unsafe (and I'm not certain we
-                        // don't have side effects from doing this unsafely)
-                        value.mark_unchanged();
-                        mutated.push((idx, value.clone()));
-                    }
-
-                    Ok(keep_going)
-                },
-            )?;
-
-            for (i, v) in mutated {
-                self.set(i, v)?;
-            }
-
-            Ok(())
-        }
+        Ok(())
     }
 }
